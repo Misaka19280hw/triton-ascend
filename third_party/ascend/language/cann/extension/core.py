@@ -448,7 +448,7 @@ def sub_vec_num(_semantic=None) -> tl.constexpr:
 
 
 @builtin
-def conv1d(input: tl.tensor, weight: tl.tensor, bias: tl.tensor = None, stride=None, padding_size=None, dilation=None,
+def conv1d(input: tl.tensor, weight: tl.tensor, bias: tl.tensor = None, stride=None, padding=None, dilation=None,
            groups=None, _semantic=None) -> tl.tensor:
     """
     Applies a 1D convolution over an input signal.
@@ -461,12 +461,12 @@ def conv1d(input: tl.tensor, weight: tl.tensor, bias: tl.tensor = None, stride=N
     :type bias: tensor or None
     :param stride: The stride of the convolution kernel. Can be an int or a 1-element tuple.
     :type stride: int or Tuple[int]
-    :param padding_size: Padding added to the input. Can be an int (symmetric
+    :param padding: Padding added to the input. Can be an int (symmetric
         on both sides), a 2-element tuple (pad_left, pad_right) (asymmetric),
         or a string.
-        ``padding_size='valid'`` is the same as no padding.
-        ``padding_size='same'`` pads the input so the output has the same shape as the input. However, this mode doesn't support any stride values other than 1.
-    :type padding_size: int, Tuple[int, int], or str
+        ``padding='valid'`` is the same as no padding.
+        ``padding='same'`` pads the input so the output has the same shape as the input. However, this mode doesn't support any stride values other than 1.
+    :type padding: int, Tuple[int, int], or str
     :param dilation: The spacing between kernel elements. Can be an int or a 1-element tuple.
     :type dilation: int or Tuple[int]
     :param groups: Number of blocked connections from input to output channels.
@@ -483,13 +483,13 @@ def conv1d(input: tl.tensor, weight: tl.tensor, bias: tl.tensor = None, stride=N
             weight_block = tl.load(weight_ptr + ...)
 
             # Perform 1D convolution
-            # Using default stride=1, padding_size=0, dilation=1, groups=1
+            # Using default stride=1, padding=0, dilation=1, groups=1
             conv_output = al.conv1d(
                 input_block,
                 weight_block,
                 bias=None,
                 stride=1,
-                padding_size=0,
+                padding=0,
                 dilation=1,
                 groups=1,
             )
@@ -502,13 +502,13 @@ def conv1d(input: tl.tensor, weight: tl.tensor, bias: tl.tensor = None, stride=N
     """
 
     stride = _unwrap_if_constexpr(stride)
-    padding_size = _unwrap_if_constexpr(padding_size)
+    padding = _unwrap_if_constexpr(padding)
     dilation = _unwrap_if_constexpr(dilation)
     groups = _unwrap_if_constexpr(groups)
 
     # Set default value
     stride = stride if stride is not None else 1
-    padding_size = padding_size if padding_size is not None else 0
+    padding = padding if padding is not None else 0
     dilation = dilation if dilation is not None else 1
     groups = groups if groups is not None else 1
 
@@ -555,18 +555,18 @@ def conv1d(input: tl.tensor, weight: tl.tensor, bias: tl.tensor = None, stride=N
     L_in = input.shape[-1]
     K = weight.shape[2]
 
-    if isinstance(padding_size, str):
-        assert padding_size in ['same', 'valid'], f"padding_size string must be 'same' or 'valid', got '{padding_size}'"
-        if padding_size == 'valid':
-            padding_size_int = 0
-        elif padding_size == 'same':
+    if isinstance(padding, str):
+        assert padding in ['same', 'valid'], f"padding string must be 'same' or 'valid', got '{padding}'"
+        if padding == 'valid':
+            padding_int = 0
+        elif padding == 'same':
             #The case where padding_needed is an odd number needs to be handled.
             if stride != 1:
-                raise ValueError("padding_size='same' is only supported when stride=1")
+                raise ValueError("padding='same' is only supported when stride=1")
             padding_needed = (L_in - 1) * stride + dilation * (K - 1) + 1 - L_in
-            padding_size_int = (padding_needed // 2, padding_needed - padding_needed // 2)
+            padding_int = (padding_needed // 2, padding_needed - padding_needed // 2)
     else:
-        padding_size_int = _check_and_normalize_padding(padding_size)
+        padding_int = _check_and_normalize_padding(padding)
 
     assert len(input.shape) in [2, 3], f"input must be a 2D (C, L) or 3D (N, C, L) tensor, got {len(input.shape)}D"
     assert len(
@@ -579,9 +579,9 @@ def conv1d(input: tl.tensor, weight: tl.tensor, bias: tl.tensor = None, stride=N
     L_in_val = _unwrap_if_constexpr(input.shape[-1])
     K_val = _unwrap_if_constexpr(weight.shape[2])
 
-    # padding_size_int is an int (uniform) or [pad_left, pad_right].
-    pad_left, pad_right = (padding_size_int, padding_size_int) \
-        if isinstance(padding_size_int, int) else padding_size_int
+    # padding_int is an int (uniform) or [pad_left, pad_right].
+    pad_left, pad_right = (padding_int, padding_int) \
+        if isinstance(padding_int, int) else padding_int
     calculation_result = (L_in_val + pad_left + pad_right - dilation * (K_val - 1) - 1) / stride + 1
     L_out_val = -int(-calculation_result)
     if is_batched:
@@ -589,7 +589,7 @@ def conv1d(input: tl.tensor, weight: tl.tensor, bias: tl.tensor = None, stride=N
     else:
         output_shape = [C_out, L_out_val]
 
-    return semantic.conv1d(input, weight, bias, stride, padding_size_int, dilation, groups, output_shape, _semantic)
+    return semantic.conv1d(input, weight, bias, stride, padding_int, dilation, groups, output_shape, _semantic)
 
 
 def _dot_to_nd_shape(shape, fractal, is_lhs):

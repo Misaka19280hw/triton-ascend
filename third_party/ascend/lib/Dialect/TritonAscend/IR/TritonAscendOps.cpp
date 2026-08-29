@@ -268,8 +268,8 @@ LogicalResult Conv1dOp::verify() {
 
   auto padding = parseConv1dParamAttr(getPadding());
   if (!padding || padding->empty() || padding->size() > 2) {
-    return emitOpError(
-        "padding must be an integer or a 2-element array [pad_left, pad_right]");
+    return emitOpError("padding must be an integer or a 2-element array "
+                       "[pad_left, pad_right]");
   }
 
   return success();
@@ -312,10 +312,10 @@ LogicalResult Conv1dOp::inferReturnTypes(
   // Uniform scalar or pair: front/back covers both forms.
   int64_t pad_left = padding->front();
   int64_t pad_right = padding->back();
-  double l_out_double =
-      static_cast<double>(L_in + pad_left + pad_right - dilation * (K - 1) - 1) /
-          stride +
-      1;
+  double l_out_double = static_cast<double>(L_in + pad_left + pad_right -
+                                            dilation * (K - 1) - 1) /
+                            stride +
+                        1;
   int64_t L_out = static_cast<int64_t>(std::floor(l_out_double));
 
   constexpr int64_t dim3 = 3;
