@@ -1104,8 +1104,8 @@ void init_ascend_ir(py::module &&m) {
             auto dilationAttr = builder.getI64IntegerAttr(dilation);
             auto groupsAttr = builder.getI64IntegerAttr(groups);
             auto op = self.create<triton::ascend::Conv1dOp>(
-                output_type, input, weight, biasValue, strideAttr,
-                paddingAttr, dilationAttr, groupsAttr);
+                output_type, input, weight, biasValue, strideAttr, paddingAttr,
+                dilationAttr, groupsAttr);
             return op.getResult();
           },
           py::arg("input"), py::arg("weight"), py::arg("bias"),
