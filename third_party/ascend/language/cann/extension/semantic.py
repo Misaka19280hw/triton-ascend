@@ -186,7 +186,7 @@ def debug_barrier(sync_mode: str, _semantic=None) -> None:
 
 
 def conv1d(input_tensor: tl.tensor, weight_tensor: tl.tensor, bias: Union[tl.tensor, None], stride: int,
-           padding_size: int, dilation: int, groups: int, output_shape, _semantic=None) -> tl.tensor:
+           padding_size: Union[int, tuple], dilation: int, groups: int, output_shape, _semantic=None) -> tl.tensor:
     bias_handle = None if bias is None else bias.handle
 
     element_ty = input_tensor.type.element_ty

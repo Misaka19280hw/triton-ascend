@@ -461,10 +461,12 @@ def conv1d(input: tl.tensor, weight: tl.tensor, bias: tl.tensor = None, stride=N
     :type bias: tensor or None
     :param stride: The stride of the convolution kernel. Can be an int or a 1-element tuple.
     :type stride: int or Tuple[int]
-    :param padding_size: Padding added to both sides of the input. Can be an int, a 1-element tuple, or a string. Can be a string {'valid', 'same'}, single number or a one-element tuple.
+    :param padding_size: Padding added to the input. Can be an int (symmetric
+        on both sides), a 2-element tuple (pad_left, pad_right) (asymmetric),
+        or a string.
         ``padding_size='valid'`` is the same as no padding.
         ``padding_size='same'`` pads the input so the output has the same shape as the input. However, this mode doesn't support any stride values other than 1.
-    :type padding_size: int, Tuple[int], or str
+    :type padding_size: int, Tuple[int, int], or str
     :param dilation: The spacing between kernel elements. Can be an int or a 1-element tuple.
     :type dilation: int or Tuple[int]
     :param groups: Number of blocked connections from input to output channels.
@@ -525,6 +527,27 @@ def conv1d(input: tl.tensor, weight: tl.tensor, bias: tl.tensor = None, stride=N
         assert isinstance(param, int), f"{name} must be an integer or a 1-element tuple, got {type(param)}"
         return param
 
+    def _check_and_normalize_padding(param):
+        """Keep ints as ints and tuples as tuples; lists are accepted and
+        converted to tuples.
+
+        Accepts an int (symmetric on both sides) or a 2-element sequence
+        [pad_left, pad_right] (asymmetric).
+        """
+        if param is None:
+            return 0
+        if isinstance(param, list):
+            assert len(param) == 2, \
+                f"padding must be an int or a 2-element sequence, got {param}"
+            return tuple(param)
+        if isinstance(param, (tuple, tl.tuple)):
+            assert len(param) == 2, \
+                f"padding must be an int or a 2-element sequence, got {param}"
+            return param
+        assert isinstance(param, int), \
+            f"padding must be an int or a 2-element sequence, got {type(param)}"
+        return param
+
     stride = _check_and_normalize_1d_param(stride, 'stride')
     dilation = _check_and_normalize_1d_param(dilation, 'dilation')
 
@@ -534,9 +557,6 @@ def conv1d(input: tl.tensor, weight: tl.tensor, bias: tl.tensor = None, stride=N
 
     if isinstance(padding_size, str):
         assert padding_size in ['same', 'valid'], f"padding_size string must be 'same' or 'valid', got '{padding_size}'"
-    else:
-        padding_size = _check_and_normalize_1d_param(padding_size, 'padding_size')
-    if isinstance(padding_size, str):
         if padding_size == 'valid':
             padding_size_int = 0
         elif padding_size == 'same':
@@ -544,9 +564,9 @@ def conv1d(input: tl.tensor, weight: tl.tensor, bias: tl.tensor = None, stride=N
             if stride != 1:
                 raise ValueError("padding_size='same' is only supported when stride=1")
             padding_needed = (L_in - 1) * stride + dilation * (K - 1) + 1 - L_in
-            padding_size_int = padding_needed // 2
+            padding_size_int = (padding_needed // 2, padding_needed - padding_needed // 2)
     else:
-        padding_size_int = padding_size if padding_size is not None else 0
+        padding_size_int = _check_and_normalize_padding(padding_size)
 
     assert len(input.shape) in [2, 3], f"input must be a 2D (C, L) or 3D (N, C, L) tensor, got {len(input.shape)}D"
     assert len(
@@ -559,7 +579,10 @@ def conv1d(input: tl.tensor, weight: tl.tensor, bias: tl.tensor = None, stride=N
     L_in_val = _unwrap_if_constexpr(input.shape[-1])
     K_val = _unwrap_if_constexpr(weight.shape[2])
 
-    calculation_result = (L_in_val + 2 * padding_size_int - dilation * (K_val - 1) - 1) / stride + 1
+    # padding_size_int is an int (uniform) or [pad_left, pad_right].
+    pad_left, pad_right = (padding_size_int, padding_size_int) \
+        if isinstance(padding_size_int, int) else padding_size_int
+    calculation_result = (L_in_val + pad_left + pad_right - dilation * (K_val - 1) - 1) / stride + 1
     L_out_val = -int(-calculation_result)
     if is_batched:
         output_shape = [input.shape[0], C_out, L_out_val]
