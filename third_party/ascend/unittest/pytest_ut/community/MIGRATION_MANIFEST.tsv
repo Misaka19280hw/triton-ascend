@@ -40,7 +40,6 @@ python/test/unit/language/test_core.py::test_convert_float16_to_float32	communit
 python/test/unit/language/test_core.py::test_cumsum_dtype	community/language/test_core.py	1	1	0	0	0	0
 python/test/unit/language/test_core.py::test_default	community/language/test_core.py	1	1	0	0	0	0
 python/test/unit/language/test_core.py::test_dot_mulbroadcasted	community/language/test_core.py	1	1	0	0	0	0
-python/test/unit/language/test_core.py::test_dot_without_load	community/language/test_core.py	2	2	0	0	0	0
 python/test/unit/language/test_core.py::test_dtype	community/language/test_core.py	1	1	0	0	0	0
 python/test/unit/language/test_core.py::test_dtype_codegen	community/language/test_core.py	1	1	0	0	0	0
 python/test/unit/language/test_core.py::test_dtype_tensor	community/language/test_core.py	13	13	0	0	0	0

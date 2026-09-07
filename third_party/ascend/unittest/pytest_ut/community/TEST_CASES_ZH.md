@@ -2,9 +2,9 @@
 
 本文逐项说明本目录迁入的社区测试函数用途，便于评审时核对测试目标。
 源码基线为 `main-dev@396df6cb5b001314e36f22220be07a560de44664`；
-共 228 个顶层测试函数、2134 个参数节点。逐函数来源及历史节点状态见
+共 227 个顶层测试函数、2132 个参数节点。逐函数来源及历史节点状态见
 `MIGRATION_MANIFEST.tsv`，本轮直接验证结果以 PR 描述为准。
-函数数量不表示每个参数节点都通过：冻结清单包含 1858 个 Pass、275 个
+函数数量不表示每个参数节点都通过：冻结清单包含 1856 个 Pass、275 个
 Skip 和 1 个 XFail；包含混合状态参数的函数须结合清单逐节点理解。
 
 ## `python/test/unit/language/test_annotations.py`
@@ -72,7 +72,6 @@ Skip 和 1 个 XFail；包含混合状态参数的函数须结合清单逐节点
 | `test_cumsum_dtype` | 验证 int1/bool 输入的 tl.cumsum 会得到可存为 int32 的累积计数 1、2、3、4。 |
 | `test_default` | 验证 JIT 辅助函数及内核的默认参数在省略和显式传值时分别取正确值。 |
 | `test_dot_mulbroadcasted` | 验证用 expand_dims、逐元素乘法和 sum 手写的分块矩阵乘得到与 NumPy matmul 一致的结果。 |
-| `test_dot_without_load` | 验证由 tl.full 直接构造、未经内存 load 的矩阵可参与 tl.dot 并得到正确乘积。 |
 | `test_dtype` | 验证指针元素类型可在 JIT 中作为 constexpr 读取，并支持相等、or 等静态类型判断。 |
 | `test_dtype_codegen` | 验证各 Triton dtype 对象的 repr 可生成完整且可求值的 triton.language 类型名称。 |
 | `test_dtype_tensor` | 验证有符号、无符号及标准浮点 tl.dtype 可作为 constexpr 参数用于构造对应类型的零张量。 |

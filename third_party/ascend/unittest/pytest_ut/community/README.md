@@ -6,8 +6,8 @@ source files.
 
 - Source baseline: `main-dev@396df6cb5b001314e36f22220be07a560de44664`
 - Migrated source files: 28
-- Migrated top-level test functions: 228
-- Historical exhaustive raw nodes: 2134 = 1858P + 275S + 1X
+- Migrated top-level test functions: 227
+- Historical exhaustive raw nodes: 2132 = 1856P + 275S + 1X
 - Historical Fail/Error nodes in this selected set: 0/0
 
 The selected test functions and their parametrization decorators are copied
@@ -32,7 +32,7 @@ tree. Current direct validation is recorded in the pull request.
 
 ## Candidates excluded after direct validation
 
-Fourteen directly validated functions are not part of this migration. Eleven
+Fifteen directly validated functions are not part of this migration. Eleven
 were excluded during the initial screening:
 
 - `test_trans_2d`, `test_trans_4d`, `test_tma_gather`, and `test_tma_scatter`
@@ -59,9 +59,25 @@ A subsequent validation on a real `Ascend950PR_9579` at PR commit
   generation with an unexpected rewrite operation and three produce results
   that differ from the PyTorch reference.
 
-These three functions account for 50 historical Pass nodes. They are removed
-as whole functions rather than partially retaining only their passing
-parameters, preserving the function-level direct-migration boundary.
+The A5 CI run for PR commit `ec0872d829081e428fe5689286eb74ebfff61460`
+([job log](https://github.com/triton-lang/triton-ascend/actions/runs/33737977388/job/100592990619))
+identified one further exclusion:
+
+- `test_dot_without_load` exposes an A5 code-generation regression in the CI
+  x86 compiler `ascendnpu-ir_1.2.0_linux-x86-pr_2863.run`
+  (BiSheng/AscendNPU-IR commit `f1168a57139a`). Its `float32` parameter
+  produces all zeros instead of 32; `float16` passes. Fresh-cache A/B runs on
+  `Ascend950PR_9579` reproduce the failure three times on both CI merge
+  `6bfed4e7a210fe35462c6fd125cfb299af1e1c91` and the later merge
+  `7ed5fae3df4c15326a0ac95d3d4f286290e3a6e7`. For each merge, the same
+  compiler input passes three times with the CANN 9.1.0 bundled compiler
+  `8796a8ac1508`. The entire function, including its passing `float16`
+  parameter, is excluded pending a compiler fix; this removes two historical
+  Pass nodes and the corresponding A5 community coverage.
+
+These four subsequent exclusions account for 52 historical Pass nodes. They
+are removed as whole functions rather than partially retaining only their
+passing parameters, preserving the function-level direct-migration boundary.
 
 They remain adaptation or backend-investigation candidates; this direct
 migration does not skip them, weaken their assertions, or silently rewrite
