@@ -940,6 +940,19 @@ CONSTRAINTS = {
             "It reuses ``add_rn_fp32`` from Triton-Ascend's bundled device library, so no additional bitcode or C++ files are needed.",
             "The test checks frontend IR generation, not device linking, numerical results, or CustomMacro synchronization; the bundled implementation targets A5.",
         ],
+        "dtype_support":
+        """
+            +------------------+----------------------------------------------------------------------------+
+            | Item             | Data type support                                                          |
+            +==================+============================================================================+
+            | Inputs / outputs | Supported tensor element types depend on the registered device function    |
+            |                  | and the target platform. Input and ``out`` types must match that function. |
+            +------------------+----------------------------------------------------------------------------+
+            | Example          | The example uses ``tl.float32`` inputs and outputs and verifies frontend   |
+            |                  | compilation only; it does not establish support for other data types       |
+            |                  | or device execution.                                                       |
+            +------------------+----------------------------------------------------------------------------+
+            """,
         "constraints": [
             "Call ``al.custom`` only inside a function decorated with ``@triton.jit``.",
             "A user-defined ``name`` must identify a CustomOp or CustomMacro registered with ``@al.register_custom_op``.",
@@ -1056,6 +1069,19 @@ CONSTRAINTS = {
             ":returns: integer quotient of the AIV Core count divided by the AIC Core count.",
             ":rtype: tl.constexpr",
         ],
+        "dtype_support":
+        """
+            +----------+--------------------------------------------------------------+
+            | Item     | Data type support                                            |
+            +==========+==============================================================+
+            | Inputs   | Not applicable: this API has no input tensors.               |
+            +----------+--------------------------------------------------------------+
+            | Return   | A Python integer wrapped in ``tl.constexpr``, not a tensor.  |
+            +----------+--------------------------------------------------------------+
+
+            The ``tl.int32`` output buffer in the example is used to observe the
+            result; it does not make this API's return value an int32 tensor.
+            """,
         "constraints": [
             "Call ``sub_vec_num`` only inside a function decorated with ``@triton.jit``.",
             "The result depends on the AIV/AIC ratio visible during JIT compilation; do not assume that every device returns 2.",
