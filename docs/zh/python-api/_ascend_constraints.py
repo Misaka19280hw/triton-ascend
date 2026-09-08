@@ -942,16 +942,18 @@ CONSTRAINTS = {
         ],
         "dtype_support":
         """
-            +------------------+----------------------------------------------------------------------------+
-            | Item             | Data type support                                                          |
-            +==================+============================================================================+
-            | Inputs / outputs | Supported tensor element types depend on the registered device function    |
-            |                  | and the target platform. Input and ``out`` types must match that function. |
-            +------------------+----------------------------------------------------------------------------+
-            | Example          | The example uses ``tl.float32`` inputs and outputs and verifies frontend   |
-            |                  | compilation only; it does not establish support for other data types       |
-            |                  | or device execution.                                                       |
-            +------------------+----------------------------------------------------------------------------+
+            This table describes tensor element types accepted by the CustomOp and
+            CustomMacro frontend, not device execution support.
+
+            +--------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
+            | 平台         | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
+            +==============+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
+            | Ascend A2/A3 |   √   |  √   |   √    |   √   |   √    |   √   |   √    |   √   |  √   |  √   |  √   |  √   |     √      |      √      |  √   |
+            +--------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
+            | Ascend 950   |   √   |  √   |   √    |   √   |   √    |   √   |   √    |   √   |  √   |  √   |  √   |  √   |     √      |      √      |  √   |
+            +--------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
+
+            Input and ``out`` types must still match the registered device implementation.
             """,
         "constraints": [
             "Call ``al.custom`` only inside a function decorated with ``@triton.jit``.",
@@ -1071,16 +1073,17 @@ CONSTRAINTS = {
         ],
         "dtype_support":
         """
-            +----------+--------------------------------------------------------------+
-            | Item     | Data type support                                            |
-            +==========+==============================================================+
-            | Inputs   | Not applicable: this API has no input tensors.               |
-            +----------+--------------------------------------------------------------+
-            | Return   | A Python integer wrapped in ``tl.constexpr``, not a tensor.  |
-            +----------+--------------------------------------------------------------+
+            +--------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
+            | 平台         | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
+            +==============+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
+            | Ascend A2/A3 | ``-`` |``-`` | ``-``  | ``-`` | ``-``  | ``-`` | ``-``  | ``-`` |``-`` |``-`` |``-`` |``-`` |   ``-``    |    ``-``    |``-`` |
+            +--------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
+            |  Ascend 950  | ``-`` |``-`` | ``-``  | ``-`` | ``-``  | ``-`` | ``-``  | ``-`` |``-`` |``-`` |``-`` |``-`` |   ``-``    |    ``-``    |``-`` |
+            +--------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
 
-            The ``tl.int32`` output buffer in the example is used to observe the
-            result; it does not make this API's return value an int32 tensor.
+            ``-`` means that tensor element types are not applicable: this API has
+            no input tensors and returns a Python integer wrapped in ``tl.constexpr``,
+            not a tensor with a fixed element type.
             """,
         "constraints": [
             "Call ``sub_vec_num`` only inside a function decorated with ``@triton.jit``.",
