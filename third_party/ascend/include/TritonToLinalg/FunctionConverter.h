@@ -31,12 +31,30 @@ namespace FunctionConverter {
 using namespace mlir;
 using namespace triton;
 
+class FuncOpConverter : public OpConversionPattern<triton::FuncOp> {
+  using OpConversionPattern<triton::FuncOp>::OpConversionPattern;
+
+public:
+  LogicalResult
+  matchAndRewrite(triton::FuncOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
 class CallOpConverter : public OpConversionPattern<triton::CallOp> {
   using OpConversionPattern<triton::CallOp>::OpConversionPattern;
 
 public:
   LogicalResult
   matchAndRewrite(triton::CallOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
+class ReturnOpConverter : public OpConversionPattern<triton::ReturnOp> {
+  using OpConversionPattern<triton::ReturnOp>::OpConversionPattern;
+
+public:
+  LogicalResult
+  matchAndRewrite(triton::ReturnOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override;
 };
 

@@ -44,6 +44,7 @@
 #include "ascend/include/TritonToUnstructure/UnstructureConversionPass.h"
 #include "ascend/include/Utils/InterleaveOptimization.h"
 
+#include "bishengir/Dialect/HACC/IR/HACC.h"
 #include "bishengir/Dialect/HFusion/IR/HFusion.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -1159,6 +1160,12 @@ void TritonToLinalgPass::convertTTFunc(triton::FuncOp func, const bool existDot,
   if (auto visibility = func.getSymVisibilityAttr();
       visibility && visibility.getValue() != "public")
     funcFunc.setSymVisibilityAttr(visibility);
+  // Helpers run on the device too. Downstream memory and vector lowering
+  // selects device functions independently of the kernel entry marker.
+  if (!func.isPublic())
+    funcFunc->setAttr(hacc::HACCFuncTypeAttr::name,
+                      hacc::HACCFuncTypeAttr::get(func.getContext(),
+                                                  hacc::HACCFuncType::DEVICE));
   if (auto noinline = func->getAttrOfType<BoolAttr>("noinline");
       noinline && noinline.getValue())
     funcFunc->setAttr("no_inline", builder.getUnitAttr());
@@ -1236,6 +1243,9 @@ void TritonToLinalgPass::addDynamicLegal(
 
   target.addDynamicallyLegalOp<triton::FuncOp>([&](triton::FuncOp op) {
     return tritonTypeConverter.isSignatureLegal(op.getFunctionType());
+  });
+  target.addDynamicallyLegalOp<triton::ReturnOp>([&](triton::ReturnOp op) {
+    return tritonTypeConverter.isLegal(op.getOperandTypes());
   });
 
   // For CustomOp/CustomMacroOp, tt.ptr should be converted to memref.
@@ -1438,10 +1448,10 @@ void TritonToLinalgPass::populateTritonToLinalgConversionPatterns(
     TypeConverter &typeConverter, RewritePatternSet &patterns,
     unsigned int launchGridRank) {
   nd2nzFlag = this->enableNd2nzOnVector;
-  populateFunctionOpInterfaceTypeConversionPattern<triton::FuncOp>(
-      patterns, typeConverter);
-  patterns.add<FunctionConverter::CallOpConverter>(typeConverter,
-                                                   patterns.getContext());
+  patterns.add<FunctionConverter::FuncOpConverter,
+               FunctionConverter::CallOpConverter,
+               FunctionConverter::ReturnOpConverter>(typeConverter,
+                                                     patterns.getContext());
 
   patterns.add<triton::MetaUseEraser>(patterns.getContext());
   patterns.add<LoadStoreConverter::StoreConverter>(patterns.getContext());
@@ -1536,13 +1546,13 @@ void TritonToLinalgPass::populateTritonToLinalgConversionPatterns(
 }
 
 void TritonToLinalgPass::getDependentDialects(DialectRegistry &registry) const {
-  registry
-      .insert<func::FuncDialect, arith::ArithDialect, math::MathDialect,
-              linalg::LinalgDialect, affine::AffineDialect, scf::SCFDialect,
-              tensor::TensorDialect, bufferization::BufferizationDialect,
-              memref::MemRefDialect, hfusion::HFusionDialect, hivm::HIVMDialect,
-              annotation::AnnotationDialect, LLVM::LLVMDialect,
-              triton::ascend::TritonAscendDialect, scope::ScopeDialect>();
+  registry.insert<func::FuncDialect, arith::ArithDialect, math::MathDialect,
+                  linalg::LinalgDialect, affine::AffineDialect, scf::SCFDialect,
+                  tensor::TensorDialect, bufferization::BufferizationDialect,
+                  memref::MemRefDialect, hacc::HACCDialect,
+                  hfusion::HFusionDialect, hivm::HIVMDialect,
+                  annotation::AnnotationDialect, LLVM::LLVMDialect,
+                  triton::ascend::TritonAscendDialect, scope::ScopeDialect>();
 }
 
 LogicalResult
