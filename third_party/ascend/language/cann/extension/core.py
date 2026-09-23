@@ -552,8 +552,8 @@ def conv1d(input: tl.tensor, weight: tl.tensor, bias: tl.tensor = None, stride=N
     dilation = _check_and_normalize_1d_param(dilation, 'dilation')
 
     is_batched = len(input.shape) == 3
-    L_in = input.shape[-1]
-    K = weight.shape[2]
+    L_in = _unwrap_if_constexpr(input.shape[-1])
+    K = _unwrap_if_constexpr(weight.shape[2])
 
     if isinstance(padding, str):
         assert padding in ['same', 'valid'], f"padding string must be 'same' or 'valid', got '{padding}'"
