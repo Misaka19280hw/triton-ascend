@@ -814,7 +814,7 @@ CONSTRAINTS = {
             "``weight``: 3D ``(oC, iC // groups, wW)``; ``iC % groups == 0`` and ``oC % groups == 0``.",
             "``bias``: optional, 1D ``(oC)``.",
             "``groups``: int; must divide both ``iC`` and ``oC`` (``iC % groups == 0`` and ``oC % groups == 0``).",
-            "``padding``: int (symmetric on both sides) or 2-element tuple ``(padding_left, padding_right)`` (asymmetric).",
+            "``padding_size``: int (symmetric on both sides), defaults to 0.",
             "``stride``: int, the stride of the convolution kernel.",
             "``dilation``: only ``dilation=1`` is currently supported.",
         ],

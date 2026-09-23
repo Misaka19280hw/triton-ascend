@@ -1,77 +1,46 @@
+---
+orphan: true
+---
+
 # al.conv2d 接口文档
 
-## 1. 背景
+## 1. conv2d 背景
 
 al.conv2d 在输入信号上执行二维卷积，支持可选偏置（bias）与分组卷积（groups），stride 与 padding 支持标量或元组形式，接口语义对齐 torch.nn.functional.conv2d。
 
-## 2. 接口说明
+## 2. conv2d 接口说明
 
-<table>
-  <tr>
-    <td>Python<br>output = al.conv2d(<br>    input,<br>    weight,<br>    bias,<br>    groups=1,<br>    padding=0,<br>    stride=1,<br>    dilation=1,<br>) -&gt; tensor :</td>
-  </tr>
-</table>
+```python
+output = al.conv2d(
+    input,
+    weight,
+    bias=None,
+    groups=1,
+    padding=0,
+    stride=1,
+    dilation=1,
+)
+```
 
-### 参数
+### conv2d 参数
 
-<table>
-  <tr>
-    <td>参数名</td>
-    <td>类型</td>
-    <td>必需</td>
-    <td>说明</td>
-  </tr>
-  <tr>
-    <td>input</td>
-    <td>tensor</td>
-    <td>是</td>
-    <td>输入张量，形状 [N, iC, iH, iW] 或 [iC, iH, iW]，N 为 batch size，iC 为输入通道数，iH / iW 为输入高 / 宽</td>
-  </tr>
-  <tr>
-    <td>weight</td>
-    <td>tensor</td>
-    <td>是</td>
-    <td>权重张量，形状 [oC, iC / groups, wH, wW]，oC 为输出通道数，wH / wW 为卷积核高 / 宽，要求 oC % groups == 0</td>
-  </tr>
-  <tr>
-    <td>bias</td>
-    <td>tensor</td>
-    <td>否</td>
-    <td>偏置张量，形状 [oC]，默认 None</td>
-  </tr>
-  <tr>
-    <td>groups</td>
-    <td>int</td>
-    <td>否</td>
-    <td>输入到输出通道的分组数，默认 1</td>
-  </tr>
-  <tr>
-    <td>padding</td>
-    <td>int / tuple</td>
-    <td>否</td>
-    <td>输入的填充，支持 int（四边对称）、2 元组 (paddingH, paddingW)（每维对称）或 4 元组 (paddingTop, paddingBottom, paddingLeft, paddingRight)（非对称），默认 0</td>
-  </tr>
-  <tr>
-    <td>stride</td>
-    <td>int / tuple</td>
-    <td>否</td>
-    <td>卷积核的步长，支持 int 或 2 元组 (strideH, strideW)，默认 1</td>
-  </tr>
-  <tr>
-    <td>dilation</td>
-    <td>int / tuple</td>
-    <td>否</td>
-    <td>卷积核元素之间的间距，支持 int 或 2 元组 (dilationH, dilationW)，暂未支持非 1，默认 1</td>
-  </tr>
-</table>
+| 参数名 | 类型 | 必需 | 说明 |
+| --- | --- | --- | --- |
+| input | tensor | 是 | 输入张量，形状 [N, iC, iH, iW] 或 [iC, iH, iW]，N 为 batch size，iC 为输入通道数，iH / iW 为输入高 / 宽 |
+| weight | tensor | 是 | 权重张量，形状 [oC, iC / groups, wH, wW]，oC 为输出通道数，wH / wW 为卷积核高 / 宽，要求 oC % groups == 0 |
+| bias | tensor | 否 | 偏置张量，形状 [oC]，默认 None |
+| groups | int | 否 | 输入到输出通道的分组数，默认 1 |
+| padding | int / tuple | 否 | 输入的填充，支持 int（四边对称）、2 元组 (paddingH, paddingW)（每维对称）或 4 元组 (paddingTop, paddingBottom, paddingLeft, paddingRight)（非对称），默认 0 |
+| stride | int / tuple | 否 | 卷积核的步长，支持 int 或 2 元组 (strideH, strideW)，默认 1 |
+| dilation | int / tuple | 否 | 卷积核元素之间的间距，支持 int 或 2 元组 (dilationH, dilationW)，暂未支持非 1，默认 1 |
 
-### 返回值
+### conv2d 返回值
 
 输出张量，形状 [N, oC, oH, oW] 或 [oC, oH, oW]。
 
-### 2.3 支持规格
+### 2.3 conv2d 支持规格
 
-#### 2.3.1 DataType 支持
+#### 2.3.1 conv2d DataType 支持
 
 | 输入类型 | int8 | int16 | int32 | uint8 | uint16 | uint32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | bool |
 | ------ | ---- | ----- | ----- | ----- | ------ | ------ | ------ | ----- | ---- | ---- | ---- | ---- | ---- |
@@ -80,9 +49,9 @@ al.conv2d 在输入信号上执行二维卷积，支持可选偏置（bias）与
 
 结论：al.conv2d 支持 fp16、bf16、fp32 三种浮点数据类型。
 
-### 2.4 约束说明
+### 2.4 conv2d 约束说明
 
-- groups 必须同时整除 iC 与 oC（oC % groups == 0）。
+- groups 必须同时整除 iC 与 oC（iC % groups == 0 且 oC % groups == 0）。
 
 - bias 为可选参数，形状必须为 [oC]。
 
@@ -92,7 +61,7 @@ al.conv2d 在输入信号上执行二维卷积，支持可选偏置（bias）与
 
 - 默认值：groups=1、padding=0、stride=1、dilation=1。
 
-## 3. 用例示例
+## 3. conv2d 用例示例
 
 ```python
 import triton

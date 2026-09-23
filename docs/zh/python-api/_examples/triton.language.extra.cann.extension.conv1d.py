@@ -40,7 +40,7 @@ def conv1d_kernel(
         weight_tile,
         bias_tile,
         groups=groups,
-        padding=padding,
+        padding_size=padding,
         stride=stride,
         dilation=1,
     )
