@@ -65,7 +65,7 @@ module attributes {hacc.target = #hacc.target<"Ascend910B2">} {
 // CHECK: %[[VAL_5:.*]] = memref.alloc() : memref<16xf16>
 // CHECK: memref.copy %[[VAL_4]], %[[VAL_5]]
 // CHECK: %[[VAL_6:.*]] = hfusion.conv1d
-// CHECK-SAME: {dilation = 1 : i32, groups = 1 : i32, padding = 0 : i32, stride = 1 : i32}
+// CHECK-SAME: {dilation = 1 : i32, groups = 1 : i32, padding = 0 : i64, stride = 1 : i32}
 // CHECK: %[[VAL_7:.*]] = memref.reinterpret_cast
 // CHECK-SAME: to offset: [0], sizes: [16, 126], strides: [126, 1]
 // CHECK: bufferization.materialize_in_destination %[[VAL_6]] in writable %[[VAL_7]]
@@ -154,7 +154,7 @@ module attributes {hacc.target = #hacc.target<"Ascend910B2">} {
 // CHECK: %[[VAL_5:.*]] = memref.alloc() : memref<30xf16>
 // CHECK: memref.copy %[[VAL_4]], %[[VAL_5]]
 // CHECK: %[[VAL_6:.*]] = hfusion.conv1d
-// CHECK-SAME: {dilation = 1 : i32, groups = 1 : i32, padding = 1 : i32, stride = 1 : i32}
+// CHECK-SAME: {dilation = 1 : i32, groups = 1 : i32, padding = 1 : i64, stride = 1 : i32}
 // CHECK: %[[VAL_7:.*]] = memref.reinterpret_cast
 // CHECK-SAME: to offset: [0], sizes: [2, 30, 128], strides: [3840, 128, 1]
 // CHECK: bufferization.materialize_in_destination %[[VAL_6]] in writable %[[VAL_7]]
