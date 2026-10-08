@@ -95,6 +95,42 @@ static Value unwrapRuntimeExtentUnsignedOperand(Value operand,
   return builder.create<triton::SplatOp>(loc, narrowedType, extend.getIn());
 }
 
+// Follow an i1 tensor to its init only when all corresponding loop edges
+// forward the same value. A while may permute condition/result slots, so do
+// not assume its before and after argument numbers are interchangeable.
+Value getInvariantLoopMaskInit(BlockArgument argument) {
+  Operation *parent = argument.getOwner()->getParentOp();
+  if (auto loop = dyn_cast<scf::ForOp>(parent)) {
+    if (argument == loop.getInductionVar())
+      return {};
+    unsigned slot = argument.getArgNumber() - 1;
+    auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    return yield.getOperand(slot) == argument ? loop.getInitArgs()[slot]
+                                              : Value();
+  }
+  if (auto loop = dyn_cast<scf::WhileOp>(parent)) {
+    auto condition = loop.getConditionOp();
+    auto yield = loop.getYieldOp();
+    BlockArgument before, after;
+    if (argument.getOwner() == &loop.getBefore().front()) {
+      before = argument;
+      after = dyn_cast<BlockArgument>(yield.getOperand(before.getArgNumber()));
+      if (!after || after.getOwner() != &loop.getAfter().front() ||
+          condition.getArgs()[after.getArgNumber()] != before)
+        return {};
+    } else {
+      after = argument;
+      before =
+          dyn_cast<BlockArgument>(condition.getArgs()[after.getArgNumber()]);
+      if (!before || before.getOwner() != &loop.getBefore().front() ||
+          yield.getOperand(before.getArgNumber()) != after)
+        return {};
+    }
+    return loop.getInits()[before.getArgNumber()];
+  }
+  return {};
+}
+
 } // namespace
 
 OpFoldResult MaskState::clampToNonNegativeIndex(const OpFoldResult value,
@@ -124,6 +160,11 @@ LogicalResult MaskState::parse(Value operand, const Location &loc,
   if (auto blockArgument = dyn_cast<BlockArgument>(operand)) {
     auto parentOp = blockArgument.getOwner()->getParentOp();
     if (auto loopOp = dyn_cast<LoopLikeOpInterface>(parentOp)) {
+      auto type = dyn_cast<RankedTensorType>(operand.getType());
+      if (type && type.getElementType().isInteger(1)) {
+        Value init = getInvariantLoopMaskInit(blockArgument);
+        return init ? parse(init, loc, builder) : failure();
+      }
       OpOperand *initArgOperand = loopOp.getTiedLoopInit(blockArgument);
       if (initArgOperand) {
         if (!isa<ShapedType>(operand.getType()))
@@ -179,25 +220,35 @@ LogicalResult MaskState::parse(Value operand, const Location &loc,
 
         // The iteration count n = (iv - lb) / step relates the induction
         // variable to the per-iteration increment: current = init + n*delta.
-        // lb/step must be compile-time constants
-        auto lb = getConstantIntValue(forOp.getLowerBound());
-        auto step = getConstantIntValue(forOp.getStep());
-        if (!lb || !step || *step == 0)
-          return failure();
-
+        // lb/step may be dynamic; cast to index and compute at runtime.
         FailureOr<Value> ivIndex = castIntegerLike(
             builder, loc, forOp.getInductionVar(), builder.getIndexType());
         if (failed(ivIndex))
           return failure();
 
         Value iterCount = *ivIndex;
-        if (*lb != 0) {
-          auto lbCst = builder.create<arith::ConstantIndexOp>(loc, *lb);
-          iterCount = builder.create<arith::SubIOp>(loc, iterCount, lbCst);
+
+        // iterCount = iv - lb  (handle dynamic or constant lb)
+        auto lb = getConstantIntValue(forOp.getLowerBound());
+        if (!lb || *lb != 0) {
+          FailureOr<Value> lbIndex = castIntegerLike(
+              builder, loc, forOp.getLowerBound(), builder.getIndexType());
+          if (failed(lbIndex))
+            return failure();
+          iterCount = builder.create<arith::SubIOp>(loc, iterCount, *lbIndex);
         }
-        if (*step != 1) {
-          auto stepCst = builder.create<arith::ConstantIndexOp>(loc, *step);
-          iterCount = builder.create<arith::DivSIOp>(loc, iterCount, stepCst);
+
+        // iterCount = (iv - lb) / step  (handle dynamic or constant step)
+        auto stepCst = getConstantIntValue(forOp.getStep());
+        if (stepCst && *stepCst == 0)
+          return failure();
+        if (!stepCst || *stepCst != 1) {
+          FailureOr<Value> stepIndex = castIntegerLike(
+              builder, loc, forOp.getStep(), builder.getIndexType());
+          if (failed(stepIndex))
+            return failure();
+          iterCount =
+              builder.create<arith::DivSIOp>(loc, iterCount, *stepIndex);
         }
 
         OpFoldResult offset =
@@ -239,6 +290,8 @@ LogicalResult MaskState::parse(Value operand, const Location &loc,
           [&](auto op) { return this->parseConstant(op, loc, builder); })
       .Case<arith::AddIOp>(
           [&](auto op) { return this->parseAdd(op, loc, builder); })
+      .Case<arith::SubIOp>(
+          [&](auto op) { return this->parseSub(op, loc, builder); })
       .Case<arith::AndIOp>(
           [&](auto op) { return this->parseAnd(op, loc, builder); })
       .Case<arith::CmpIOp>(
@@ -424,6 +477,42 @@ LogicalResult MaskState::addStates(const MaskState &lhsState,
   }
 }
 
+LogicalResult MaskState::subStateScalar(const MaskState &state,
+                                        const OpFoldResult scalar,
+                                        const Location &loc,
+                                        OpBuilder &builder) {
+  start = subOpFoldResult(state.start, scalar, loc, builder);
+  end = subOpFoldResult(state.end, scalar, loc, builder);
+  if (!start || !end)
+    return failure();
+  dims = state.dims;
+  offsets = state.offsets;
+
+  bool allDimsOne = llvm::all_of(state.dims, [](OpFoldResult dim) {
+    return getConstantIntValue(dim).value() == std::optional<int64_t>(1);
+  });
+  if (allDimsOne) {
+    this->scalar = this->start;
+  }
+
+  return success();
+}
+
+LogicalResult MaskState::subStates(const MaskState &lhsState,
+                                   const MaskState &rhsState,
+                                   const Location &loc, OpBuilder &builder) {
+  // Contiguous mask indices only keep a monotonic range when subtracting a
+  // scalar from a range: (arange - C). scalar - range is rejected.
+  if (!lhsState.scalar && rhsState.scalar)
+    return subStateScalar(lhsState, rhsState.scalar, loc, builder);
+
+  InFlightDiagnostic diag =
+      emitWarning(loc)
+      << "Unsupported subi for continuous mask: only (range - scalar) is "
+         "supported";
+  return failure();
+}
+
 LogicalResult MaskState::divStateScalar(const MaskState &state,
                                         const OpFoldResult scalar,
                                         const Location &loc,
@@ -538,6 +627,21 @@ LogicalResult MaskState::parseAdd(arith::AddIOp addOp, const Location &loc,
     return failure();
   }
   return this->addStates(lhsState, rhsState, loc, builder);
+}
+
+LogicalResult MaskState::parseSub(arith::SubIOp subOp, const Location &loc,
+                                  OpBuilder &builder) {
+  assert(this->isEmpty());
+  MaskState lhsState;
+  if (failed(lhsState.parse(subOp.getLhs(), loc, builder))) {
+    return failure();
+  }
+
+  MaskState rhsState;
+  if (failed(rhsState.parse(subOp.getRhs(), loc, builder))) {
+    return failure();
+  }
+  return this->subStates(lhsState, rhsState, loc, builder);
 }
 
 LogicalResult MaskState::parseDiv(arith::DivSIOp divOp, const Location &loc,
