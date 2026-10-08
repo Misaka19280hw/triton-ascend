@@ -64,7 +64,7 @@ using namespace mlir::triton;
 using namespace hivm;
 
 static constexpr int kIntegerBitWidth = 32;
-static constexpr int NzDimWidth = 16;
+static constexpr int iniNzDimWidth = 16;
 
 static uint64_t getElemBytesForAlign(Type t) {
   static constexpr uint64_t kBitsPerByte = 8;
@@ -96,6 +96,66 @@ static uint64_t getBlockElemsFor32BAlign(Type elemType) {
     return 1;
   }
   return kAlignBytes / elemBytes;
+}
+
+std::pair<bool, bool>
+InterCoreTransferAndSyncPass::analyzeMatmulOperand(DependencyInfo &dep) {
+  bool isMatmulA = true;
+  bool isTranspose = false;
+
+  Value startValue = dep.value;
+
+  llvm::DenseSet<Value> visited;
+  SmallVector<Value> chain;
+  chain.push_back(startValue);
+  visited.insert(startValue);
+
+  while (!chain.empty()) {
+    Value currentValue = chain.back();
+    chain.pop_back();
+
+    for (Operation *userOp : currentValue.getUsers()) {
+      if (CVPipeline::getOpBlockId(userOp) != dep.iniConsumerBlockId) {
+        continue;
+      }
+      if (auto matmulOp = dyn_cast<linalg::MatmulOp>(userOp)) {
+        auto operands = matmulOp->getOperands();
+        if (operands[0] == currentValue) {
+          isMatmulA = true;
+        } else if (operands[1] == currentValue) {
+          isMatmulA = false;
+        } else {
+          LOG_DEBUG("[error] matmul C is from Vector!");
+          CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
+        }
+
+        Operation *defOp = currentValue.getDefiningOp();
+        if (defOp && isa<linalg::TransposeOp>(defOp)) {
+          isTranspose = true;
+        }
+        return {isMatmulA, isTranspose};
+      }
+
+      for (Value result : userOp->getResults()) {
+        if (visited.insert(result).second) {
+          chain.push_back(result);
+        }
+      }
+    }
+  }
+
+  return {isMatmulA, isTranspose};
+}
+
+int InterCoreTransferAndSyncPass::getNzDimWidth(DependencyInfo &dep,
+                                                int64_t blk) {
+  auto [isA, isTransposed] = analyzeMatmulOperand(dep);
+  if (blk == 32) {
+    if (isA == isTransposed) {
+      return iniNzDimWidth * 2;
+    }
+  }
+  return iniNzDimWidth;
 }
 
 static void attachCommonTags(Operation *op, int blockId, StringRef coreType) {
@@ -337,7 +397,8 @@ bool InterCoreTransferAndSyncPass::isOuterLayerDependency(
 
 // Nd2NzNormalizer
 SmallVector<int64_t>
-InterCoreTransferAndSyncPass::computeExpectedShape(mlir::Value depValue) {
+InterCoreTransferAndSyncPass::computeExpectedShape(mlir::Value depValue,
+                                                   int NzDimWidth) {
   auto tensorTy = dyn_cast<TensorType>(depValue.getType());
   static constexpr int NdShapeLength = 2;
   if (!tensorTy || tensorTy.getRank() != NdShapeLength) {
@@ -476,8 +537,18 @@ void InterCoreTransferAndSyncPass::Nd2NzNormalize(OpBuilder &builder,
     return;
   }
 
+  Type elemType = cast<RankedTensorType>(origValue.getType()).getElementType();
+  int64_t blk = getBlockElemsFor32BAlign(elemType);
+  if (blk == 0) {
+    LOG_DEBUG("Invalid block size.\n");
+    return;
+  }
+
+  auto NzDimWidth = getNzDimWidth(dep, blk);
+
   // Step 1: Compute expected shape
-  SmallVector<int64_t> expectedShape = computeExpectedShape(origValue);
+  SmallVector<int64_t> expectedShape =
+      computeExpectedShape(origValue, NzDimWidth);
   int originBlockId = dep.iniProducerBlockId;
   // Step 2: If shapes match, return original value
   bool isEqualedShape = isExpectedShape(origValue, expectedShape);
@@ -491,13 +562,6 @@ void InterCoreTransferAndSyncPass::Nd2NzNormalize(OpBuilder &builder,
   auto srcTensorType = cast<RankedTensorType>(newValue.getType());
   int64_t M = srcTensorType.getDimSize(0);
   int64_t N = srcTensorType.getDimSize(1);
-  Type elemType = srcTensorType.getElementType();
-
-  int64_t blk = getBlockElemsFor32BAlign(elemType);
-  if (blk == 0) {
-    LOG_DEBUG("Invalid block size.\n");
-    return;
-  }
 
   SmallVector<int64_t> shape3D = {M, N / blk, blk};
   SmallVector<int64_t> shapeTrans = {N / blk, M, blk};
@@ -937,7 +1001,6 @@ InterCoreTransferAndSyncPass::getTransferPipeConfig(Operation *transferOp,
   auto pipeVAttr = PipeAttr::get(module.getContext(), hivm::PIPE::PIPE_V);
   auto pipeMte3Attr = PipeAttr::get(module.getContext(), hivm::PIPE::PIPE_MTE3);
   auto pipeMte1Attr = PipeAttr::get(module.getContext(), hivm::PIPE::PIPE_MTE1);
-  auto pipeMAttr = PipeAttr::get(module.getContext(), hivm::PIPE::PIPE_M);
   auto pipeSAttr = PipeAttr::get(module.getContext(), hivm::PIPE::PIPE_S);
   TransferPipeConfig config;
   if (isa<hivm::FixpipeOp>(transferOp)) {
@@ -963,7 +1026,7 @@ InterCoreTransferAndSyncPass::getTransferPipeConfig(Operation *transferOp,
   } else if (isa<hivm::CopyOp>(transferOp)) {
     config.forReadTPipe = pipeMte3Attr;
     config.forReadPipe = pipeMte1Attr;
-    config.forWriteTPipe = pipeMAttr;
+    config.forWriteTPipe = pipeMte1Attr;
     config.forWritePipe = pipeMte3Attr;
     config.srcCoreAttr = vecCoreAttr;
     config.dstCoreAttr = cubeCoreAttr;
@@ -1612,7 +1675,9 @@ LogicalResult InterCoreTransferAndSyncPass::handleVectorToCube(
   Operation *transferOp = insertVectorToCubeTransfer(
       builder, srcValue, normalizedVal, prodEnd, consStart, loc, transferIndex,
       dep, is1DTensorDependency(dep.value), &consumedDataOp);
-
+  if (!transferOp) {
+    return failure();
+  }
   int flagId = flagManager.acquireId();
   auto [newConsStart, newConsEnd] =
       getBlockStartEnd(dep.consumerBlockId, module);

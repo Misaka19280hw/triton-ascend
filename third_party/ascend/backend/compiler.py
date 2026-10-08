@@ -42,6 +42,7 @@ try:
 except ImportError:
     distributed = None
 from triton.backends.ascend.utils import (
+    _multibuffer_mode_to_tuple,
     _check_bishengir_api_change,
     _check_bishengir_able_save_ir,
     _check_bishengir_is_regbased,
@@ -248,7 +249,7 @@ def _finalize_program_launch_policy(metadata, opt):
 
 def _adjust_metadata_by_module_result(mod, metadata, opt, **kwargs):
     rc = _get_then_remove_rc(mod, "triton_ascend.dynamic_cv_pipeline.rc")
-    if rc == 4:
+    if rc == 3:
         metadata["disable_vf_operand_substitution"] = True
         return
     if rc != -1 and rc > 0:
@@ -294,6 +295,12 @@ def _graph_optimize_kwargs(opt):
     return kwargs
 
 
+def _serialize_module(mod, opt):
+    if getattr(opt, "debug", False) or not _is_debug_line_info_disabled() or _enable_msdebug():
+        return str(mod)
+    return mod.str_nodebug()
+
+
 def make_ttir(mod, metadata, opt):
     if "hash" not in metadata:
         metadata["hash"] = hashlib.sha256(f"{mod}-{metadata}".encode()).hexdigest()
@@ -321,10 +328,10 @@ def make_ttir(mod, metadata, opt):
     return mod
 
 
-def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
+def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
     # use triton_adapter to lower Triton-MLIR to linalg
     # Get Triton-MLIR as string
-    ttir_code = str(mod)
+    ttir_code = _serialize_module(mod, opt)
     auto_map_parallel_blocks_enabled = _is_auto_map_parallel_blocks_enabled()
     # This is compiler-derived safety metadata, never a user compile option.
     # Derive it even when the feature is currently disabled so a later runtime
@@ -338,7 +345,8 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
     with tempfile.TemporaryDirectory() as tmpdir:
         src_path = os.path.join(tmpdir, "kernel.ttir.mlir")
         dst_path = os.path.join(tmpdir, "kernel.ttadapter.mlir")
-        Path(src_path).write_text(ttir_code)
+        if opt.debug:
+            Path(src_path).write_text(ttir_code)
         triton_adapter_opt_path = _get_triton_adapter_opt_path()
 
         # Select analysis is a fixed lowering policy, not a user compile option.
@@ -389,7 +397,6 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             metadata["set_workspace_multibuffer"] = 0
             metadata["enable_mixed_cv"] = True
             metadata["disable_auto_inject_block_sync"] = True
-            ascend.passes.ttir.set_enable_cube_block_merge(metadata["enable_cube_block_merge"])
 
             # Must run before add_dynamic_cv_pipeline because the driven
             # AddMultiBufferInnerScope pass reads the module-level
@@ -437,7 +444,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             dump_manager = get_dump_manager(metadata["hash"])
             dump_manager.put(str(mod), "kernel.ttadapter.mlir", binary=False)
 
-        return str(mod)
+        return _serialize_module(mod, opt)
 
 
 def linalg_to_bc_by_triton_mlir_opt(linalg: str, metadata, opt):
@@ -498,13 +505,14 @@ def bc_to_linalg_by_bishengir_opt(bc_data: bytes, metadata, opt):
 
         bishengir_opt_path, env = _get_bishengir_opt_path()
 
-        subprocess.run([
+        cmd = [
             bishengir_opt_path,
             bc_path,
-            "--mlir-print-debuginfo",
-            "-o",
-            mlir_path,
-        ], env=env, capture_output=True, check=True, text=True)
+        ]
+        if opt.debug:
+            cmd += ["--mlir-print-debuginfo"]
+        cmd += ["-o", mlir_path]
+        subprocess.run(cmd, env=env, capture_output=True, check=True, text=True)
 
         # Read the generated MLIR text
         linalg_text = Path(mlir_path).read_text()
@@ -563,6 +571,8 @@ def _parse_linalg_metadata(linalg: str, metadata: dict):
     # Note: Compiled Kernel requires to estimate size of shared memory to occupy
     # Currently, NPU backend does not limit on shared memory
     metadata["shared"] = 1
+    module_attrs = re.search(r'\bmodule(?:\s+@\w+)?\s+attributes\s*\{([^}]*)\}', linalg)
+    metadata["has_full_row_copy"] = bool(module_attrs and re.search(r'\btt\.full_row_copy\b', module_attrs.group(1)))
     # Force disable auto tile and bind subblock if attribute is present in module
     metadata["auto_tile_and_bind_subblock"] = not re.search(DISABLE_AUTO_TILE_AND_BIND_SUBBLOCK_REGEX, linalg)
     # Turn off auto-blockify only for the ORDERED (token-ring) sync_block_lock:
@@ -635,19 +645,25 @@ def get_common_bishengir_compile_options(metadata):
     return [bishengir_target_opt]
 
 
-def _needs_lib_call_no_inline(metadata):
-    arch = metadata['target'].arch
-    return arch.startswith("Ascend950")
-
-
 @functools.lru_cache()
-def _npu_compiler_supports_option(compiler_path: str, option: str) -> bool:
+def _supports_full_row_copy_inlining(compiler_path):
     try:
         result = subprocess.run([compiler_path, "--help"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                 timeout=10, check=False)
     except (OSError, subprocess.SubprocessError):
         return False
-    return option in result.stdout
+    return result.returncode == 0 and "--enable-lib-call-no-inline" in result.stdout
+
+
+def _full_row_copy_compile_options(metadata, compiler_path):
+    # A shared noinline load helper loses constant-width specialization when
+    # the masked tail also calls it. Scope this to compiler-versioned A5 SIMD
+    # loads; other kernels retain the NPU compiler's default inlining policy.
+    if (metadata.get("has_full_row_copy", False) and metadata["target"].arch.startswith("Ascend950")
+            and metadata.get("mix_mode") == "aiv" and metadata.get("parallel_mode") == "simd"
+            and _supports_full_row_copy_inlining(compiler_path)):
+        return ["--enable-lib-call-no-inline=false"]
+    return []
 
 
 def get_auto_bind_sub_block_option(metadata):
@@ -670,6 +686,12 @@ def _save_npuir_debug_output(stdout_bytes: bytes, stderr_bytes: bytes, tmpdir: s
 
     dump_manager = get_dump_manager(metadata_hash)
     dump_manager.put(Path(output_path).read_text(encoding='utf-8'), "kernel.npuir.mlir", binary=False)
+
+
+def _dump_kernel_binary(metadata_hash: str, bin_path: str):
+    """Copy the compiled kernel object into the TRITON_DEBUG dump directory."""
+    dump_manager = get_dump_manager(metadata_hash)
+    dump_manager.put(Path(bin_path).read_bytes(), os.path.basename(bin_path), binary=True)
 
 
 def try_compile_with_config(linalg: str, ub_config: Dict[str, Any], metadata: dict, opt) -> Tuple[bool, str]:
@@ -719,6 +741,11 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         bin_path = os.path.join(tmpdir, bin_file_with_ext)
         callback_path = os.path.join(tmpdir, "libkernel.so")
         _compile_option_list = get_common_bishengir_compile_options(metadata)
+
+        multibuffer_mode = metadata.get("multibuffer_mode")
+        if multibuffer_mode is not None:
+            mode_arg = "[" + ",".join(f"({level},{count})" for level, count in multibuffer_mode) + "]"
+            _compile_option_list.append(f"--multibuffer-mode={mode_arg}")
 
         multibuffer = metadata.get("multibuffer")
         num_stages = metadata.get("num_stages")
@@ -863,9 +890,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
                 "--enable-hfusion-compile=true",
                 "--enable-triton-kernel-compile=true",
             ]
-            if (_needs_lib_call_no_inline(metadata)
-                    and _npu_compiler_supports_option(npu_compiler_path, "--enable-lib-call-no-inline")):
-                _compile_option_list += ["--enable-lib-call-no-inline=false"]
+            _compile_option_list += _full_row_copy_compile_options(metadata, npu_compiler_path)
             # Temporary until the NPU compiler enables batch matmul by default in Q4.
             if metadata.get("enable_hivm_batch_matmul"):
                 _compile_option_list += ["--enable-hivm-batch-matmul"]
@@ -874,9 +899,9 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         bisheng_options = metadata["bisheng_options"]
         if bisheng_options is not None:
             _compile_option_list += [f"--append-bisheng-options={bisheng_options}"]
-        _compile_option_list += ["--mlir-print-ir-after-failure"]
-        _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
         if opt.debug:
+            _compile_option_list += ["--mlir-print-ir-after-failure"]
+            _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
             _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
 
         vf_merge_level = metadata["vf_merge_level"]
@@ -893,11 +918,15 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         if plan_memory_strategy is not None:
             _compile_option_list += [f"--plan-memory-strategy={plan_memory_strategy}"]
 
+        if opt.debug:
+            src_file, _ = _get_dump_paths(metadata["hash"], ttadapter_path, bin_file)
+            _compile_option_list += [f"--save-temps={os.path.dirname(src_file)}"]
+
         cmd_list = ([npu_compiler_path, ttadapter_path] + _compile_option_list + ["-o", bin_file])
 
         if opt.debug or os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
             print_cmd_list = cmd_list.copy()
-            print_cmd_list[1], print_cmd_list[-1] = _get_dump_paths(metadata["hash"], ttadapter_path, bin_file)
+            print_cmd_list[1], print_cmd_list[-1] = _get_dump_paths(metadata["hash"], ttadapter_path, bin_path)
             print(f"[DEBUG] cmd_list: {shlex.join(print_cmd_list)}")
 
         try:
@@ -921,6 +950,9 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             print(f"[DEBUG] {bin_path} is not found")
             print(f"[DEBUG] Stderr:\n{error_msg}")
             raise subprocess.CalledProcessError(ret.returncode, cmd_list, ret.stdout, ret.stderr)
+
+        if opt.debug:
+            _dump_kernel_binary(metadata["hash"], bin_path)
 
         if Path(callback_path).is_file():
             lib = ctypes.CDLL(callback_path)
@@ -954,6 +986,11 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
         _compile_option_list = [
             f"--target={NPUUtils().get_arch()}",
         ]
+
+        multibuffer_mode = metadata.get("multibuffer_mode")
+        if multibuffer_mode is not None:
+            mode_arg = "[" + ",".join(f"({level},{count})" for level, count in multibuffer_mode) + "]"
+            _compile_option_list.append(f"--multibuffer-mode={mode_arg}")
 
         multibuffer = metadata.get("multibuffer")
         num_stages = metadata.get("num_stages")
@@ -1088,20 +1125,21 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
                 bishengir_hivm_opt,
                 "--enable-triton-kernel-compile=true",
             ]
-            if (_needs_lib_call_no_inline(metadata)
-                    and _npu_compiler_supports_option(npu_compiler_path, "--enable-lib-call-no-inline")):
-                _compile_option_list += ["--enable-lib-call-no-inline=false"]
 
-        _compile_option_list += ["--mlir-print-ir-after-failure"]
-        _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
         if opt.debug:
+            _compile_option_list += ["--mlir-print-ir-after-failure"]
+            _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
             _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
+
+        if opt.debug:
+            src_file, _ = _get_dump_paths(metadata["hash"], ttadapter_path, bin_file)
+            _compile_option_list += [f"--save-temps={os.path.dirname(src_file)}"]
 
         cmd_list = ([npu_compiler_path, ttadapter_path] + _compile_option_list + ["-o", bin_file])
 
         if opt.debug or os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
             print_cmd_list = cmd_list.copy()
-            print_cmd_list[1], print_cmd_list[-1] = _get_dump_paths(metadata["hash"], ttadapter_path, bin_file)
+            print_cmd_list[1], print_cmd_list[-1] = _get_dump_paths(metadata["hash"], ttadapter_path, bin_path)
             print(f"[DEBUG] cmd_list: {shlex.join(print_cmd_list)}")
 
         try:
@@ -1124,6 +1162,9 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             print(f"[DEBUG] {bin_path} is not found")
             print(f"[DEBUG] Stderr:\n{error_msg}")
             raise subprocess.CalledProcessError(ret.returncode, cmd_list, ret.stdout, ret.stderr)
+
+        if opt.debug:
+            _dump_kernel_binary(metadata["hash"], bin_path)
 
         if Path(callback_path).is_file():
             lib = ctypes.CDLL(callback_path)
@@ -1163,8 +1204,8 @@ def _normalize_compile_mode(compile_mode, arch: str) -> str:
 
     ``simd_simt_template`` is the portable default: it retains the ordinary
     SIMD pipeline on A2/A3 and enables the existing template-SIMT subpaths on
-    A5.  ``unstructured_in_simt`` is an equivalent spelling of that mode.
-    Pure-SIMT remains an A5-only explicit compile mode.
+    Ascend 950.  ``unstructured_in_simt`` is an equivalent spelling of that mode.
+    Pure-SIMT remains an Ascend 950-only explicit compile mode.
     """
     if not isinstance(compile_mode, str):
         raise ValueError("compile_mode must be a string; expected one of: " + ", ".join(_CANONICAL_COMPILE_MODES))
@@ -1175,7 +1216,7 @@ def _normalize_compile_mode(compile_mode, arch: str) -> str:
                          ", ".join(_CANONICAL_COMPILE_MODES))
 
     if canonical_mode == "simt_only" and not _is_a5_target_arch(arch):
-        raise ValueError('compile_mode="simt_only" is supported only on A5 targets.')
+        raise ValueError('compile_mode="simt_only" is supported only on Ascend 950 targets.')
     return canonical_mode
 
 
@@ -1194,7 +1235,8 @@ class NPUOptions:
     cluster_dims: tuple = (1, 1, 1)
     num_warps: int = 32
     num_ctas: int = 1
-    num_stages: int = 2
+    # Keep an omitted stage count distinct from an explicit mode.
+    num_stages: Optional[int] = None
     # Ascend threads-per-warp is a backend capability, not a compile option.
     warp_size: int = field(default=32, init=False)
     ir_override: Optional[str] = None  # filename of a user-defined IR (*.{ttir|ttadapter|mlirbc|bcmlir|npubin})
@@ -1220,6 +1262,8 @@ class NPUOptions:
     extern_libs: dict = None
     bisheng_options: str = "-cce-link-aicore-ll-module " + get_libdevice()
     multibuffer: bool = True
+    # Public dictionaries are stored as sorted pairs for hashing and JSON caches.
+    multibuffer_mode: Optional[Union[Dict[str, int], Tuple[Tuple[str, int], ...]]] = None
     vf_fusion_mode: str = None
     enable_ubuf_saving: bool = None
     disable_size_align_for_cast: bool = None
@@ -1229,7 +1273,7 @@ class NPUOptions:
     enable_hivm_auto_cv_balance: bool = None
     # Temporary 910_95 switch; the NPU compiler plans to make this default in Q4.
     enable_hivm_batch_matmul: bool = False
-    # Only takes effect on the A5 non-pure-SIMT BiShengIR compilation path.
+    # Only takes effect on the Ascend 950 non-pure-SIMT BiShengIR compilation path.
     enable_vf_stack_limit: bool = False
     sync_solver: bool = None
     unit_flag: bool = None
@@ -1263,7 +1307,7 @@ class NPUOptions:
     is_pure_simt: bool = field(default=False, init=False)
     # Only takes effect on the pure-SIMT path.
     shared_mem_dynamic_size: int = None
-    # A5 pure-SIMT-only option passed as -simt-optimization-mode
+    # Ascend 950 pure-SIMT-only option passed as -simt-optimization-mode
     # to bishengir-compile. Its value grammar belongs to the toolchain.
     # Individual digits are passed to various passes to control behavior,
     # and are parsed right-to-left.
@@ -1273,7 +1317,6 @@ class NPUOptions:
     # Canonical modes: SIMD (D), SIMD with template-SIMT (P), and pure-SIMT
     # (T). ``unstructured_in_simt`` is an equivalent P spelling.
     compile_mode: str = "simd_simt_template"
-    simt_stack_limit: int = None
     # disable simt fma optimization to get high precision
     disable_fma: bool = False
 
@@ -1341,6 +1384,11 @@ class NPUOptions:
         # Keep the legacy name discoverable while its property and all
         # compiler decisions continue to use the injected target architecture.
         self.__dict__["arch"] = arch
+        object.__setattr__(self, "multibuffer_mode", _multibuffer_mode_to_tuple(self.multibuffer_mode))
+        if self.multibuffer_mode is not None and self.num_stages is not None:
+            raise ValueError("num_stages and multibuffer_mode cannot be specified together")
+        if self.multibuffer_mode is None and self.num_stages is None:
+            object.__setattr__(self, "num_stages", 2)
         if self.compile_on_910_95 is not None:
             _warn_deprecated_npu_option("compile_on_910_95")
         object.__setattr__(
@@ -1354,8 +1402,6 @@ class NPUOptions:
             raise ValueError(f"invalid GraphOptimize rule_mask: {error}") from error
         if normalized_rule_mask != DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK:
             object.__setattr__(self, "rule_mask", normalized_rule_mask)
-        if self.simt_stack_limit is not None:
-            _validate_simt_stack_limit(self.simt_stack_limit)
 
         compile_mode = str(_normalize_compile_mode(self.compile_mode, arch))
         object.__setattr__(self, "compile_mode", compile_mode)
@@ -1405,7 +1451,7 @@ def _is_internal_npu_options(options, target_arch: str) -> bool:
 
 
 def _normalize_bishengir_simt_optimization_for_context(options: NPUOptions, raw_options) -> None:
-    """Restrict the vendor SIMT optimization switch to its A5 pure-SIMT path."""
+    """Restrict the vendor SIMT optimization switch to its Ascend 950 pure-SIMT path."""
     option_name = "simt_optimization_mode"
     if option_name not in raw_options:
         return
@@ -1416,7 +1462,7 @@ def _normalize_bishengir_simt_optimization_for_context(options: NPUOptions, raw_
         return
 
     warnings.warn(
-        "simt_optimization_mode only takes effect for A5 "
+        "simt_optimization_mode only takes effect for Ascend 950 "
         "pure-SIMT compilation; ignoring the explicit value.",
         UserWarning,
         stacklevel=3,
@@ -1426,9 +1472,10 @@ def _normalize_bishengir_simt_optimization_for_context(options: NPUOptions, raw_
 
 def ttir_to_npubin(mod, metadata, opt):
     _export_program_grid_metadata(mod, metadata, require_row_contract=True)
-    ttir_code = str(mod)
+    ttir_code = _serialize_module(mod, opt)
     metadata = _parse_ttir_metadata(ttir_code, metadata)
     _finalize_program_launch_policy(metadata, opt)
+
     with tempfile.TemporaryDirectory() as tmpdir:
         # prepare input
         src_path = os.path.join(tmpdir, "kernel.ttir.mlir")
@@ -1446,7 +1493,7 @@ def ttir_to_npubin(mod, metadata, opt):
             _compile_option_list += [f"--threads-per-warp={opt.warp_size}"]
             if opt.simt_optimization_mode != 0000000:
                 _compile_option_list += [f"--simt-optimization-mode={opt.simt_optimization_mode}"]
-            _compile_option_list += [f"--simt-stack-limit={get_simt_stack_limit(opt.simt_stack_limit)}"]
+            _compile_option_list += [f"--simt-stack-limit={get_simt_stack_limit()}"]
             if opt.shared_mem_dynamic_size is not None:
                 _compile_option_list += [f"--shared-mem-dynamic-size={opt.shared_mem_dynamic_size}"]
             if opt.disable_fma:
@@ -1479,20 +1526,10 @@ def ttir_to_npubin(mod, metadata, opt):
         return Path(bin_path).read_bytes()
 
 
-def _validate_simt_stack_limit(stack_limit):
-    if isinstance(stack_limit, bool) or not isinstance(stack_limit, int) or stack_limit <= 0:
-        raise ValueError("simt_stack_limit must be a positive integer")
-    return stack_limit
-
-
-def get_simt_stack_limit(user_stack_limit=None):
+def get_simt_stack_limit():
     # simt_stack_limit resolution precedence:
-    #  1. An explicit Triton compile option.
-    #  2. torch_npu's acl_default.json "StackSize":{"simt_stack_size":N}.
-    #  3. The kernel-time default simt_stack_limit=1152.
-    if user_stack_limit is not None:
-        return _validate_simt_stack_limit(user_stack_limit)
-
+    #  1. torch_npu's acl_default.json "StackSize":{"simt_stack_size":N}.
+    #  2. The kernel-time default simt_stack_limit=1152.
     _simt_stack_limit = 1152
     try:
         import torch_npu
@@ -1604,7 +1641,7 @@ class AscendBackend(BaseBackend):
             if options.is_pure_simt:
                 stages["npubin"] = (lambda src, metadata: ttir_to_npubin(src, metadata, options))
                 return
-            stages["ttadapter"] = lambda src, metadata: ttir_to_linalg(src, metadata, options, named_ops=True)
+            stages["ttadapter"] = lambda src, metadata: ttir_to_linalg(src, metadata, options)
             # Normal kernels always convert Linalg IR to bytecode and back to MLIR text.
             stages["mlirbc"] = lambda src, metadata: linalg_to_bc_by_triton_mlir_opt(src, metadata, options)
             stages["bcmlir"] = lambda src, metadata: bc_to_linalg_by_bishengir_opt(src, metadata, options)
@@ -1626,4 +1663,6 @@ class AscendBackend(BaseBackend):
         return str(version_key)
 
     def get_module_map(self) -> Dict[str, ModuleType]:
-        return {}
+        from triton.language.extra.cann import libdevice
+
+        return {"triton.language.extra.libdevice": libdevice}
