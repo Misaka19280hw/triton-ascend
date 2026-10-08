@@ -26,9 +26,9 @@ func.func @fp8_missing_lhs(%a: tensor<16x64xf8E4M3FN>, %b: tensor<64x32xf8E5M2>,
 
 // -----
 
-// The ordinary floating-point path represents scales as signed exponents.
+// FP16 and BF16 use the same E8M0 encoding of one as the MX path.
 // CHECK-LABEL: func.func @fp16_missing_lhs
-// CHECK: arith.constant 0 : i8
+// CHECK: arith.constant 127 : i8
 // CHECK: tensor.empty() : tensor<16x2xi8>
 // CHECK: linalg.matmul
 func.func @fp16_missing_lhs(%a: tensor<16x64xf16>, %b: tensor<64x32xf16>, %sb: tensor<32x2xi8>, %c: tensor<16x32xf32>) -> tensor<16x32xf32> {
@@ -39,7 +39,7 @@ func.func @fp16_missing_lhs(%a: tensor<16x64xf16>, %b: tensor<64x32xf16>, %sb: t
 // -----
 
 // CHECK-LABEL: func.func @bf16_missing_lhs
-// CHECK: arith.constant 0 : i8
+// CHECK: arith.constant 127 : i8
 // CHECK: tensor.empty() : tensor<32x1xi8>
 // CHECK: linalg.matmul
 func.func @bf16_missing_lhs(%a: tensor<32x32xbf16>, %b: tensor<32x16xbf16>, %sb: tensor<16x1xi8>, %c: tensor<32x16xf32>) -> tensor<32x16xf32> {
@@ -51,7 +51,7 @@ func.func @bf16_missing_lhs(%a: tensor<32x32xbf16>, %b: tensor<32x16xbf16>, %sb:
 
 // Neither side needs scaling; K below one scale block must remain nonempty.
 // CHECK-LABEL: func.func @fp16_missing_both_small_k
-// CHECK: arith.constant 0 : i8
+// CHECK: arith.constant 127 : i8
 // CHECK: tensor.empty() : tensor<16x1xi8>
 // CHECK: linalg.matmul
 func.func @fp16_missing_both_small_k(%a: tensor<16x16xf16>, %b: tensor<16x32xf16>, %c: tensor<16x32xf32>) -> tensor<16x32xf32> {
