@@ -1,5 +1,4 @@
 import ctypes
-import importlib.util
 import os
 from pathlib import Path
 import subprocess
@@ -9,26 +8,27 @@ import pytest
 import torch
 import triton
 import triton.language as tl
+from triton.backends.ascend import launcher
 
 
 @pytest.fixture(scope="module")
 def scalar_encoder(tmp_path_factory):
-    path = Path(__file__).resolve().parents[2] / "backend" / "driver.py"
-    spec = importlib.util.spec_from_file_location("ascend_scalar_driver", path)
-    driver = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(driver)
+    headers = Path(launcher.__file__).with_name("launcher_src")
     directory = tmp_path_factory.mktemp("scalar_encoder")
     source = directory / "encode.cpp"
-    source.write_text("#include <cstdint>\n#include <cstring>\n" + driver._CPP_LOW_PRECISION_SCALARS + r'''
+    source.write_text(r'''#include "launcher_args.h"
 extern "C" void encode(const float *values, uint16_t *output, int size, bool bf16) {
   for (int i = 0; i < size; ++i)
-    output[i] = bf16 ? float_to_bf16(values[i]) : float_to_fp16(values[i]);
+    output[i] = bf16 ? triton::ascend::floatToBF16(values[i]) : triton::ascend::floatToFP16(values[i]);
 }
 ''')
     library = directory / "encode.so"
-    subprocess.run(
-        [os.environ.get("CXX", "c++"), "-shared", "-fPIC", "-O2",
-         str(source), "-o", str(library)], check=True, capture_output=True)
+    subprocess.run([
+        os.environ.get("CXX", "c++"), "-shared", "-fPIC", "-O2", "-std=c++17", "-I",
+        str(headers),
+        str(source), "-o",
+        str(library)
+    ], check=True, capture_output=True)
     function = ctypes.CDLL(str(library)).encode
     function.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_bool]
     return function
