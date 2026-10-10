@@ -453,6 +453,10 @@ def conv1d(input: tl.tensor, weight: tl.tensor, bias: tl.tensor = None, stride=N
     """
     Applies a 1D convolution over an input signal.
 
+    .. note::
+
+        Enabling 1:2 (Cube:Vector) mode is currently not supported.
+
     :param input: Input tensor of shape (N, C_in, L_in) or (C_in, L_in). N is a batch size, C denotes a number of channels, L is a length of signal sequence.
     :type input: tensor
     :param weight: Weight tensor of shape (C_out, C_in // groups, kernel_size).
