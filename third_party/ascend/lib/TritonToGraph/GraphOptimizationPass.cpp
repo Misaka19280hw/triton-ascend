@@ -22,6 +22,7 @@
 
 #include "Rules/FoldHistogramParking.h"
 #include "Rules/NarrowUnsignedTensor.h"
+#include "Rules/SplitPackedTensor.h"
 #include "TritonToGraph/GraphOptimizationContext.h"
 #include "TritonToGraph/GraphOptimizationRule.h"
 #include "TritonToGraph/Passes.h"
@@ -303,6 +304,9 @@ void GraphOptimizePass::runOnOperation() {
       }
     }
   }
+
+  if (options.compileOn91095)
+    split_packed_tensor::run(getOperation());
 
   ModuleOp module = getOperation();
   SmallVector<std::unique_ptr<GraphOptimizationRule>> ownedRules;
