@@ -447,6 +447,18 @@ def sub_vec_num(_semantic=None) -> tl.constexpr:
     return tl.constexpr(const_val)
 
 
+def _reject_conv1d_padding_size(fn):
+
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if "padding_size" in kwargs:
+            raise TypeError("conv1d() got an unexpected keyword argument 'padding_size'; use 'padding' instead.")
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
+@_reject_conv1d_padding_size
 @builtin
 def conv1d(input: tl.tensor, weight: tl.tensor, bias: tl.tensor = None, stride=None, padding=None, dilation=None,
            groups=None, _semantic=None) -> tl.tensor:
