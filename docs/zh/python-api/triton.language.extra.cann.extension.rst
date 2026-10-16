@@ -53,10 +53,6 @@ Vector Operations
     conv1d
     dot
 
-.. note::
-
-    ``conv1d`` 暂不支持开启 1:2（Cube:Vector）模式。
-
 Enums
 -----
 
