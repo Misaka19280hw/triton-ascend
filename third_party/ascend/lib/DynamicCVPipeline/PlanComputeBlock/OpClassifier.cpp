@@ -28,18 +28,23 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/LogicalResult.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Value.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/ViewLikeInterface.h"
 #include "mlir/Support/LLVM.h"
 
@@ -144,8 +149,9 @@ void OpClassifierPass::initializePass(ModuleOp module) {
   inBroadcastChain.clear();
   CloneOpMap.clear();
 
-  // Collect all operations
-  module.walk([&](Operation *op) {
+  // Collect all operations. PostOrder stamps a nested container's core_type
+  // before an enclosing yield reads it.
+  module.walk<WalkOrder::PostOrder>([&](Operation *op) {
     if (isa<ModuleOp, func::FuncOp, func::ReturnOp>(op)) {
       return; // Skip module, function, and return ops
     }
@@ -790,6 +796,11 @@ bool OpClassifierPass::shouldSkipCubeUpstream(Operation *op) {
     LOG_DEBUG("skip " << *op << ": Extracted Load/Store Related");
     return true;
   }
+  if (isa<scf::ForOp, scf::WhileOp, scf::IfOp>(op)) {
+    LLVM_DEBUG(DBGS() << "skip " << op->getName().getStringRef()
+                      << ": scf dialect op\n");
+    return true;
+  }
   return false;
 }
 
@@ -1073,6 +1084,26 @@ int OpClassifierPass::propagateVectorUpstream() {
 
 namespace {
 
+Value getAliasSource(Value val) {
+  auto *op = val.getDefiningOp();
+  if (!op) {
+    return nullptr;
+  }
+  return llvm::TypeSwitch<Operation *, Value>(op)
+      .Case([](ViewLikeOpInterface viewOp) { return viewOp.getViewSource(); })
+      .Case([](bufferization::ToTensorOp totensorOp) {
+        return totensorOp.getBuffer();
+      })
+      .Default([](auto) { return nullptr; });
+}
+
+Value getViewSource(Value val) {
+  while (auto source = getAliasSource(val)) {
+    val = source;
+  }
+  return val;
+}
+
 // A loader loop may only contain data-movement and (scalar) index computation.
 // Any tensor-producing compute op means the loop does real vector work and must
 // not be swallowed into the cube pipe.
@@ -1092,13 +1123,36 @@ bool isDisqualifyingLoaderOp(Operation *op) {
       }
     }
   }
+  if (auto memInt = llvm::dyn_cast<MemoryEffectOpInterface>(op)) {
+    // No matmul - must not be store to gm
+    llvm::SmallVector<MemoryEffects::EffectInstance> effects;
+    memInt.getEffects(effects);
+    for (auto effect : effects) {
+      Value val = effect.getValue();
+      if (!val || !isa<MemoryEffects::Write>(effect.getEffect())) {
+        continue;
+      }
+      val = getViewSource(val);
+      if (auto barg = llvm::dyn_cast<BlockArgument>(val)) {
+        if (llvm::isa<func::FuncOp>(barg.getOwner()->getParentOp())) {
+          return true;
+        }
+      }
+    }
+  }
   return false;
 }
 
 } // namespace
 
 bool OpClassifierPass::isCubeLoaderForOp(scf::ForOp forOp) {
+  if (forOp->hasAttr(hivm::ExtractLoadStoreAttr))
+    return false;
+
   // Every result must be live and used only by CUBE consumers
+  if (forOp.getNumResults() == 0) {
+    return false;
+  }
   for (Value result : forOp.getResults()) {
     for (Operation *user : result.getUsers()) {
       if (isa<linalg::MatmulOp>(user) || getCoreType(user) == OP_CUBE_ONLY)
@@ -1157,7 +1211,7 @@ markLoopBodyAsCube(Operation *loop, Block *body,
   opCoreTypes[loop] = OP_CUBE_ONLY;
 }
 
-int OpClassifierPass::penetrateCubeIntoForLoops() {
+llvm::LogicalResult OpClassifierPass::penetrateCubeIntoForLoops() {
   // Collect first so recoloring earlier loops cannot perturb the scan.
   // Use a combined walk to collect both ForOps and WhileOps
   llvm::SmallVector<Operation *> loaderLoops;
@@ -1176,7 +1230,7 @@ int OpClassifierPass::penetrateCubeIntoForLoops() {
       markLoopBodyAsCube(loop, body, opCoreTypes);
   }
 
-  return 0;
+  return llvm::success();
 }
 
 // ============================================================================
@@ -1245,6 +1299,14 @@ bool OpClassifierPass::shouldStopPropagationForYield(
 
   // Stop at func.func or builtin.module
   if (isa<func::FuncOp, ModuleOp>(op)) {
+    return true;
+  }
+
+  // Stop at hivm.hir.custom so the BFS does not cross from the SSA tensor
+  // world back into the memref world via memory dependencies and overwrite
+  // classifications already decided in earlier passes (e.g., a CUBE-classified
+  // memref.alloc that backs a matmul input via bufferization.to_tensor).
+  if (isa<hivm::CustomOp>(op)) {
     return true;
   }
 
@@ -1410,14 +1472,22 @@ void OpClassifierPass::processYieldOperation(Operation *op,
       // Case 2: then region yield of scf.if, or scf.for yield
       // ---------------------------------------------------------------
       // Determine type from the operand's defining operation:
-      //   - OP_CUBE_ONLY -> yield type is "CUBE"
-      //   - anything else (OP_UNDETERMINED, OP_VECTOR_ONLY) -> "VECTOR"
+      //   - CUBE -> yield type is "CUBE"
+      //   - anything else (UNDETERMINED, VECTOR) -> "VECTOR"
       // If the operand is a BlockArgument without a defining op (e.g., an
       // iter_arg that is passed through without modification), default to
       // VECTOR since no compute op is associated with it.
+      //
+      // getValueCoreType picks the i-th component of a nested container's
+      // ssbuffer.core_type; compute ops are not stamped until step 9, so they
+      // miss that lookup and fall back to the opCoreTypes map.
       if (Operation *def = operand.getDefiningOp()) {
-        OpCoreType ct = getCoreType(def);
-        if (ct == OP_CUBE_ONLY) {
+        CoreType ct = getValueCoreType(operand);
+        if (ct == CVPipeline::UNDETERMINED) {
+          ct = getCoreType(def) == OP_CUBE_ONLY ? CVPipeline::CUBE_ONLY
+                                                : CVPipeline::VECTOR_ONLY;
+        }
+        if (ct == CVPipeline::CUBE_ONLY) {
           coreTypes.push_back(OP_CUBE_ONLY);
         } else {
           coreTypes.push_back(OP_VECTOR_ONLY);
@@ -1867,8 +1937,7 @@ void OpClassifierPass::runOnOperation() {
   }
 
   // Step 4: Penetrate CUBE coloring into pure loader for-loops.
-  if (CVPipeline::isCubeBlockMergeEnabled() &&
-      penetrateCubeIntoForLoops() != 0) {
+  if (penetrateCubeIntoForLoops().failed()) {
     CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
     return;
   }

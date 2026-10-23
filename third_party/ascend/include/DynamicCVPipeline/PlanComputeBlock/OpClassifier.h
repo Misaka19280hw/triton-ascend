@@ -23,9 +23,8 @@
 #ifndef TRITON_ADAPTER_OP_CLASSIFIER_H
 #define TRITON_ADAPTER_OP_CLASSIFIER_H
 
-#include "ascend/include/DynamicCVPipeline/Common/MemoryEffectsTracker.h"
-#include "bishengir/Dialect/Annotation/IR/Annotation.h"
-#include "bishengir/Dialect/HIVM/IR/HIVM.h"
+#include "llvm/Support/LogicalResult.h"
+
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -142,7 +141,7 @@ private:
 
   // Step 4.5: Penetrate CUBE coloring into pure loader scf.for loops whose
   // results are consumed exclusively by CUBE ops.
-  int penetrateCubeIntoForLoops();
+  llvm::LogicalResult penetrateCubeIntoForLoops();
 
   // Helper: decide whether an scf.for or scf.while is a pure cube-loader loop
   bool isCubeLoaderForOp(scf::ForOp forOp);
