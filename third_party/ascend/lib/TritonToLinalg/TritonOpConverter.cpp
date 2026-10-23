@@ -3204,7 +3204,7 @@ public:
     }
     llvm::SmallPtrSet<Operation *, 16> visited;
     std::function<void(Value, bool)> visit = [&](Value value,
-                                                bool throughTranspose) {
+                                                 bool throughTranspose) {
       Operation *def = value ? value.getDefiningOp() : nullptr;
       if (!def || !hasOneLogicalUse(value) || !visited.insert(def).second)
         return;
