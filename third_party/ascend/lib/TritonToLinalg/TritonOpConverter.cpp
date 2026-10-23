@@ -2663,6 +2663,41 @@ static Value decomposeF32Dot(triton::DotOp op, Value a, Value b, Value c,
                              ConversionPatternRewriter &rewriter) {
   auto loc = op.getLoc();
   auto dstTy = cast<RankedTensorType>(c.getType());
+  if (dstTy.getRank() == 3) {
+    // Keep every batch's residual accumulation local to one 2D dot sequence.
+    // This also avoids requiring a backend batch-matmul to carry nonzero
+    // accumulators between several dependent partial products.
+    Value lower = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value upper =
+        rewriter.create<arith::ConstantIndexOp>(loc, dstTy.getDimSize(0));
+    Value step = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    auto loop =
+        rewriter.create<scf::ForOp>(loc, lower, upper, step, ValueRange{c});
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(loop.getBody());
+    auto offsets = SmallVector<OpFoldResult>{loop.getInductionVar(),
+                                             rewriter.getIndexAttr(0),
+                                             rewriter.getIndexAttr(0)};
+    auto strides = SmallVector<OpFoldResult>(3, rewriter.getIndexAttr(1));
+    auto sizes = [&](Value value) {
+      auto type = cast<RankedTensorType>(value.getType());
+      return SmallVector<OpFoldResult>{
+          rewriter.getIndexAttr(1), rewriter.getIndexAttr(type.getDimSize(1)),
+          rewriter.getIndexAttr(type.getDimSize(2))};
+    };
+    auto slice = [&](Value value) -> Value {
+      auto type = cast<RankedTensorType>(value.getType());
+      auto sliceType = RankedTensorType::get(type.getShape().drop_front(),
+                                             type.getElementType());
+      return rewriter.create<tensor::ExtractSliceOp>(
+          loc, sliceType, value, offsets, sizes(value), strides);
+    };
+    Value batch = decomposeF32Dot(op, slice(a), slice(b), slice(c), rewriter);
+    Value result = rewriter.create<tensor::InsertSliceOp>(
+        loc, batch, loop.getRegionIterArg(0), offsets, sizes(c), strides);
+    rewriter.create<scf::YieldOp>(loc, result);
+    return loop.getResult(0);
+  }
   auto zero = rewriter.create<arith::ConstantOp>(
       loc, DenseElementsAttr::get(
                dstTy, rewriter.getFloatAttr(dstTy.getElementType(), 0)));

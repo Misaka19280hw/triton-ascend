@@ -15,8 +15,10 @@ func.func @tf32x3_matrix(%a: tensor<16x16xf32>, %b: tensor<16x16xf32>, %c: tenso
 // -----
 
 // CHECK-LABEL: func.func @tf32x3_batch
+// CHECK: scf.for
+// CHECK: tensor.extract_slice
 // CHECK-NOT: tt.dot
-// CHECK-COUNT-3: linalg.batch_matmul {{.*}}input_precision = "ieee"
+// CHECK-COUNT-3: linalg.matmul {{.*}}input_precision = "ieee"
 // CHECK: arith.addf
 // CHECK: return
 func.func @tf32x3_batch(%a: tensor<2x16x16xf32>, %b: tensor<2x16x16xf32>, %c: tensor<2x16x16xf32>) -> tensor<2x16x16xf32> {
@@ -39,8 +41,10 @@ func.func @bf16x3_matrix(%a: tensor<16x16xf32>, %b: tensor<16x16xf32>, %c: tenso
 // -----
 
 // CHECK-LABEL: func.func @bf16x3_batch
+// CHECK: scf.for
+// CHECK: tensor.extract_slice
 // CHECK-NOT: tt.dot
-// CHECK-COUNT-3: linalg.batch_matmul {{.*}}input_precision = "ieee"
+// CHECK-COUNT-3: linalg.matmul {{.*}}input_precision = "ieee"
 // CHECK: arith.addf
 // CHECK: return
 func.func @bf16x3_batch(%a: tensor<2x16x16xf32>, %b: tensor<2x16x16xf32>, %c: tensor<2x16x16xf32>) -> tensor<2x16x16xf32> {
@@ -63,8 +67,10 @@ func.func @bf16x6_matrix(%a: tensor<16x16xf32>, %b: tensor<16x16xf32>, %c: tenso
 // -----
 
 // CHECK-LABEL: func.func @bf16x6_batch
+// CHECK: scf.for
+// CHECK: tensor.extract_slice
 // CHECK-NOT: tt.dot
-// CHECK-COUNT-6: linalg.batch_matmul {{.*}}input_precision = "ieee"
+// CHECK-COUNT-6: linalg.matmul {{.*}}input_precision = "ieee"
 // CHECK: arith.addf
 // CHECK: return
 func.func @bf16x6_batch(%a: tensor<2x16x16xf32>, %b: tensor<2x16x16xf32>, %c: tensor<2x16x16xf32>) -> tensor<2x16x16xf32> {
