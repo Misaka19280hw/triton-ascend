@@ -2656,6 +2656,99 @@ LogicalResult DeviceAssertConverter::matchAndRewrite(
   return success();
 }
 
+// Match the upstream F32DotTC decompositions without emitting target-specific
+// PTX. Each partial product uses IEEE accumulation: rounding the operands is
+// explicit, so the backend must not round them again to HF32.
+static Value decomposeF32Dot(triton::DotOp op, Value a, Value b, Value c,
+                             ConversionPatternRewriter &rewriter) {
+  auto loc = op.getLoc();
+  auto dstTy = cast<RankedTensorType>(c.getType());
+  auto zero = rewriter.create<arith::ConstantOp>(
+      loc, DenseElementsAttr::get(
+               dstTy, rewriter.getFloatAttr(dstTy.getElementType(), 0)));
+  auto matmul = [&](Value lhs, Value rhs, Value acc) -> Value {
+    Operation *dot;
+    if (dstTy.getRank() == 2)
+      dot = rewriter.create<linalg::MatmulOp>(loc, ValueRange{lhs, rhs},
+                                              ValueRange{acc});
+    else
+      dot = rewriter.create<linalg::BatchMatmulOp>(loc, ValueRange{lhs, rhs},
+                                                   ValueRange{acc});
+    dot->setAttr("input_precision", rewriter.getStringAttr("ieee"));
+    return dot->getResult(0);
+  };
+  auto clearResidualNaNs = [&](Value value) -> Value {
+    // HFusion supports ordered comparisons; unordered predicates are not part
+    // of its comparison contract. x == x is false exactly for NaN.
+    auto ordered = rewriter.create<arith::CmpFOp>(
+        loc, arith::CmpFPredicate::OEQ, value, value);
+    return rewriter.create<arith::SelectOp>(loc, ordered, value, zero);
+  };
+  Value result;
+  if (op.getInputPrecision() == InputPrecision::TF32x3) {
+    // The high component uses cvt.rna.tf32.f32 semantics (nearest, ties away
+    // from zero). TF32 matrix instructions consume only the top ten mantissa
+    // bits of the residual. Preserve non-finite values before truncating bits,
+    // otherwise a small NaN payload could become infinity.
+    auto toTF32 = [&](Value value, bool roundNearest) -> Value {
+      auto valueTy = cast<RankedTensorType>(value.getType());
+      auto bitsTy = valueTy.clone(rewriter.getI32Type());
+      auto constant = [&](uint32_t bits) -> Value {
+        return rewriter.create<arith::ConstantOp>(
+            loc, DenseElementsAttr::get(bitsTy, APInt(32, bits)));
+      };
+      Value bits = rewriter.create<arith::BitcastOp>(loc, bitsTy, value);
+      Value magnitude =
+          rewriter.create<arith::AndIOp>(loc, bits, constant(0x7fffffff));
+      Value special = rewriter.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::uge, magnitude, constant(0x7f800000));
+      Value rounded = bits;
+      if (roundNearest)
+        rounded = rewriter.create<arith::AddIOp>(loc, bits, constant(0x1000));
+      rounded =
+          rewriter.create<arith::AndIOp>(loc, rounded, constant(0xffffe000));
+      rounded = rewriter.create<arith::SelectOp>(loc, special, bits, rounded);
+      return rewriter.create<arith::BitcastOp>(loc, valueTy, rounded);
+    };
+    Value aHi = toTF32(a, true);
+    Value bHi = toTF32(b, true);
+    Value aLo = toTF32(rewriter.create<arith::SubFOp>(loc, a, aHi), false);
+    Value bLo = toTF32(rewriter.create<arith::SubFOp>(loc, b, bHi), false);
+    result = matmul(aLo, bHi, zero);
+    result = matmul(aHi, bLo, result);
+    result = matmul(aHi, bHi, clearResidualNaNs(result));
+  } else {
+    unsigned count = op.getInputPrecision() == InputPrecision::BF16x6 ? 3 : 2;
+    auto split = [&](Value value) {
+      SmallVector<Value> parts;
+      auto valueTy = cast<RankedTensorType>(value.getType());
+      auto partTy = valueTy.clone(rewriter.getBF16Type());
+      for (unsigned i = 0; i < count; ++i) {
+        Value part = rewriter.create<arith::TruncFOp>(loc, partTy, value);
+        parts.push_back(part);
+        if (i + 1 != count) {
+          Value wide = rewriter.create<arith::ExtFOp>(loc, valueTy, part);
+          value = rewriter.create<arith::SubFOp>(loc, value, wide);
+        }
+      }
+      return parts;
+    };
+    auto lhs = split(a);
+    auto rhs = split(b);
+    result = zero;
+    if (count == 3) {
+      result = matmul(lhs[1], rhs[1], result);
+      result = matmul(lhs[2], rhs[0], result);
+      result = matmul(lhs[0], rhs[2], result);
+    }
+    result = matmul(lhs[1], rhs[0], result);
+    result = matmul(lhs[0], rhs[1], result);
+    result = matmul(lhs[0], rhs[0], clearResidualNaNs(result));
+  }
+  // Add the original accumulator exactly once, after all partial products.
+  return rewriter.create<arith::AddFOp>(loc, result, c);
+}
+
 LogicalResult
 MatmulConverter::matchAndRewrite(triton::DotOp op, OpAdaptor adaptor,
                                  ConversionPatternRewriter &rewriter) const {
@@ -2665,6 +2758,31 @@ MatmulConverter::matchAndRewrite(triton::DotOp op, OpAdaptor adaptor,
   auto dstType = cast<RankedTensorType>(op.getType());
   auto elemTy = dstType.getElementType();
   auto inputPrec = op.getInputPrecision();
+  if (inputPrec == InputPrecision::TF32x3 ||
+      inputPrec == InputPrecision::BF16x3 ||
+      inputPrec == InputPrecision::BF16x6) {
+    if (cast<RankedTensorType>(opa.getType()).getElementType().isF32() &&
+        cast<RankedTensorType>(opb.getType()).getElementType().isF32()) {
+      bool narrowAccumulator =
+          isa<FloatType>(elemTy) && elemTy.getIntOrFloatBitWidth() < 32;
+      if (narrowAccumulator)
+        opc = rewriter.create<arith::ExtFOp>(
+            op.getLoc(), dstType.clone(rewriter.getF32Type()), opc);
+      Value result = decomposeF32Dot(op, opa, opb, opc, rewriter);
+      if (narrowAccumulator) {
+        auto trunc =
+            rewriter.create<arith::TruncFOp>(op.getLoc(), dstType, result);
+        trunc->setAttr("round_mode",
+                       hfusion::RoundModeAttr::get(rewriter.getContext(),
+                                                   hfusion::RoundMode::RINT));
+        result = trunc;
+      }
+      rewriter.replaceOp(op, result);
+      return success();
+    }
+    // As in upstream, input_precision only changes FP32 multiplication.
+    inputPrec = InputPrecision::IEEE;
+  }
   // Ascend does not support tf32;  map it to hf32 which provides similar
   // functionality.HF32 is only valid for fp32 x fp32 inputs; for other
   // dtypes, fall back to ieee.
