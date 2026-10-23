@@ -3240,6 +3240,59 @@ public:
       visit(source, false);
   }
 
+  // Native MX already tiles ordinary operands internally. Introduce an outer
+  // M/N loop only when slicing an operand actually reduces an indirect load's
+  // address tensor. Follow the same supported paths as slice(), including its
+  // transpose ownership proof; merely finding a load below an opaque op is not
+  // sufficient. Ineligible snapshots and scale-only loads do not require a
+  // new full-result assembly buffer.
+  bool shrinksIndirectLoad(Value source, ArrayRef<int64_t> shape) const {
+    auto type = dyn_cast<RankedTensorType>(source.getType());
+    Operation *def = source.getDefiningOp();
+    if (!type || !def || shape.size() != type.getRank())
+      return false;
+    if (auto call = dyn_cast<func::CallOp>(def))
+      return eligibleLoads.contains(call) &&
+             llvm::any_of(llvm::zip(shape, type.getShape()), [](auto dims) {
+               return std::get<0>(dims) < std::get<1>(dims);
+             });
+    if (auto transpose = dyn_cast<linalg::TransposeOp>(def)) {
+      if (!tileBulkLoads || !transpose.hasPureTensorSemantics() ||
+          !canTileTransposeInput(transpose.getInput()))
+        return false;
+      SmallVector<int64_t> inputShape(shape.size());
+      for (auto [dim, inputDim] : llvm::enumerate(transpose.getPermutation()))
+        inputShape[inputDim] = shape[dim];
+      return shrinksIndirectLoad(transpose.getInput(), inputShape);
+    }
+    if (auto broadcast = dyn_cast<triton::BroadcastOp>(def)) {
+      auto inputType = cast<RankedTensorType>(broadcast.getSrc().getType());
+      SmallVector<int64_t> inputShape(shape);
+      for (int64_t dim = 0; dim < type.getRank(); ++dim)
+        if (inputType.getDimSize(dim) == 1)
+          inputShape[dim] = 1;
+      return shrinksIndirectLoad(broadcast.getSrc(), inputShape);
+    }
+    if (auto expand = dyn_cast<triton::ExpandDimsOp>(def)) {
+      SmallVector<int64_t> inputShape(shape);
+      inputShape.erase(inputShape.begin() + expand.getAxis());
+      return shrinksIndirectLoad(expand.getSrc(), inputShape);
+    }
+    if (def->getNumResults() != 1 || def->getNumRegions() != 0 ||
+        !def->hasTrait<OpTrait::Elementwise>() || !isMemoryEffectFree(def))
+      return false;
+    bool shrinks = false;
+    for (Value operand : def->getOperands()) {
+      auto operandType = dyn_cast<RankedTensorType>(operand.getType());
+      if (!operandType)
+        continue;
+      if (operandType.getShape() != type.getShape())
+        return false;
+      shrinks |= shrinksIndirectLoad(operand, shape);
+    }
+    return shrinks;
+  }
+
   Value slice(OpBuilder &builder, Value source, ArrayRef<OpFoldResult> offsets,
               ArrayRef<OpFoldResult> sizes) {
     auto type = cast<RankedTensorType>(source.getType());
@@ -3751,15 +3804,26 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
   constexpr int64_t fallbackTile = 32;
   constexpr int64_t nativeTile = 32;
   int64_t tileLimit = useNativeMx ? nativeTile : fallbackTile;
-  if (dstType.getRank() == 2 &&
+  auto tileSize = [&](int64_t dim) {
+    int64_t size = std::min(dim, tileLimit);
+    while (dim % size)
+      size /= 2;
+    return size;
+  };
+  ScaledDotLoadTiler loadTiler(op, rewriter, /*tileBulkLoads=*/useNativeMx);
+  loadTiler.prepare({op.getA(), op.getB(), op.getAScale(), op.getBScale()},
+                    {lhs, rhs, lhsScale, rhsScale});
+  auto rhsTy = cast<RankedTensorType>(rhs.getType());
+  bool tileNative =
+      useNativeMx && dstType.hasStaticShape() && dstType.getDimSize(0) > 0 &&
+      dstType.getDimSize(1) > 0 &&
+      (loadTiler.shrinksIndirectLoad(
+           lhs, {tileSize(dstType.getDimSize(0)), lhsTy.getDimSize(1)}) ||
+       loadTiler.shrinksIndirectLoad(
+           rhs, {rhsTy.getDimSize(0), tileSize(dstType.getDimSize(1))}));
+  if ((!useNativeMx || tileNative) && dstType.getRank() == 2 &&
       (dstType.getDimSize(0) > tileLimit || dstType.getDimSize(1) > tileLimit ||
        (!useNativeMx && logicalK > fallbackTile))) {
-    auto tileSize = [&](int64_t dim) {
-      int64_t size = std::min(dim, tileLimit);
-      while (dim % size)
-        size /= 2;
-      return size;
-    };
     int64_t tileM = tileSize(dstType.getDimSize(0));
     int64_t tileN = tileSize(dstType.getDimSize(1));
     int64_t tileK = useNativeMx ? logicalK : tileSize(logicalK);
@@ -3785,9 +3849,6 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
     // Bulk-copy and transpose sinking bounds native MX input storage. Keep
     // the software path's established load layout: its vector subblock
     // partitioning is independent of native MX tile assembly.
-    ScaledDotLoadTiler loadTiler(op, rewriter, /*tileBulkLoads=*/useNativeMx);
-    loadTiler.prepare({op.getA(), op.getB(), op.getAScale(), op.getBScale()},
-                      {lhs, rhs, lhsScale, rhsScale});
     auto slice = [&](OpBuilder &builder, Value source, Value row, Value col,
                      int64_t rows, int64_t cols) -> Value {
       SmallVector<OpFoldResult> offsets{row, col};
