@@ -3686,44 +3686,84 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
       return slice(builder, scale, nonK, divideIndex(builder, k, groupSize),
                    nonKSize, tileK / groupSize);
     };
-    auto mLoop = rewriter.create<scf::ForOp>(
-        loc, zero, mEnd, mStep, ValueRange{c},
-        [&](OpBuilder &mBuilder, Location, Value m, ValueRange mAcc) {
-          auto nLoop = mBuilder.create<scf::ForOp>(
-              loc, zero, nEnd, nStep, mAcc,
-              [&](OpBuilder &nBuilder, Location, Value n, ValueRange nAcc) {
-                Value tileAcc = slice(nBuilder, nAcc[0], m, n, tileM, tileN);
-                auto kLoop = nBuilder.create<scf::ForOp>(
-                    loc, zero, kEnd, kStep, ValueRange{tileAcc},
-                    [&](OpBuilder &builder, Location, Value k,
-                        ValueRange kAcc) {
-                      Value a = operandSlice(builder, lhs, m, k, tileM, tileK,
-                                             lhsElemType ==
-                                                 triton::ScaleDotElemType::E2M1,
-                                             !op.getLhsKPack());
-                      Value b = operandSlice(builder, rhs, k, n, tileK, tileN,
-                                             rhsElemType ==
-                                                 triton::ScaleDotElemType::E2M1,
-                                             op.getRhsKPack());
-                      Value sa = scaleSlice(builder, lhsScale, m, k, tileM);
-                      Value sb = scaleSlice(builder, rhsScale, n, k, tileN);
-                      auto dot = builder.create<triton::DotScaledOp>(
-                          loc, kAcc[0].getType(), a, b, kAcc[0], sa, sb,
-                          lhsElemType, rhsElemType, op.getFastMath(),
-                          op.getLhsKPack(), op.getRhsKPack());
-                      builder.create<scf::YieldOp>(loc, dot.getResult());
-                    });
-                SmallVector<OpFoldResult> offsets{m, n};
-                SmallVector<OpFoldResult> sizes{nBuilder.getIndexAttr(tileM),
-                                                nBuilder.getIndexAttr(tileN)};
-                SmallVector<OpFoldResult> strides(2, nBuilder.getIndexAttr(1));
-                Value result = nBuilder.create<tensor::InsertSliceOp>(
-                    loc, kLoop.getResult(0), nAcc[0], offsets, sizes, strides);
-                nBuilder.create<scf::YieldOp>(loc, result);
-              });
-          mBuilder.create<scf::YieldOp>(loc, nLoop.getResults());
-        });
-    Value result = mLoop.getResult(0);
+    auto computeTile = [&](OpBuilder &tileBuilder, Value m, Value n,
+                           Value fullAcc) -> Value {
+      Value tileAcc = slice(tileBuilder, fullAcc, m, n, tileM, tileN);
+      auto kLoop = tileBuilder.create<scf::ForOp>(
+          loc, zero, kEnd, kStep, ValueRange{tileAcc},
+          [&](OpBuilder &builder, Location, Value k, ValueRange kAcc) {
+            Value a =
+                operandSlice(builder, lhs, m, k, tileM, tileK,
+                             lhsElemType == triton::ScaleDotElemType::E2M1,
+                             !op.getLhsKPack());
+            Value b =
+                operandSlice(builder, rhs, k, n, tileK, tileN,
+                             rhsElemType == triton::ScaleDotElemType::E2M1,
+                             op.getRhsKPack());
+            Value sa = scaleSlice(builder, lhsScale, m, k, tileM);
+            Value sb = scaleSlice(builder, rhsScale, n, k, tileN);
+            auto dot = builder.create<triton::DotScaledOp>(
+                loc, kAcc[0].getType(), a, b, kAcc[0], sa, sb, lhsElemType,
+                rhsElemType, op.getFastMath(), op.getLhsKPack(),
+                op.getRhsKPack());
+            builder.create<scf::YieldOp>(loc, dot.getResult());
+          });
+      return kLoop.getResult(0);
+    };
+    Value result;
+    if (!compileOn91095) {
+      // A2/A3's dynamic tensor insertion lowers to padded prefix/suffix
+      // concatenations. Write each disjoint output tile once instead. Read C
+      // from its original snapshot; this fresh buffer never aliases it.
+      auto outputType =
+          MemRefType::get(f32Type.getShape(), rewriter.getF32Type());
+      Value output = rewriter.create<memref::AllocOp>(loc, outputType);
+      rewriter.create<scf::ForOp>(
+          loc, zero, mEnd, mStep, ValueRange{},
+          [&](OpBuilder &mBuilder, Location, Value m, ValueRange) {
+            mBuilder.create<scf::ForOp>(
+                loc, zero, nEnd, nStep, ValueRange{},
+                [&](OpBuilder &nBuilder, Location, Value n, ValueRange) {
+                  Value tile = computeTile(nBuilder, m, n, c);
+                  SmallVector<OpFoldResult> offsets{m, n};
+                  SmallVector<OpFoldResult> sizes{nBuilder.getIndexAttr(tileM),
+                                                  nBuilder.getIndexAttr(tileN)};
+                  SmallVector<OpFoldResult> strides(2,
+                                                    nBuilder.getIndexAttr(1));
+                  Value destination = nBuilder.create<memref::SubViewOp>(
+                      loc, output, offsets, sizes, strides);
+                  auto write =
+                      nBuilder
+                          .create<bufferization::MaterializeInDestinationOp>(
+                              loc, tile, destination);
+                  write.setWritable(true);
+                  nBuilder.create<scf::YieldOp>(loc);
+                });
+            mBuilder.create<scf::YieldOp>(loc);
+          });
+      result = rewriter.create<bufferization::ToTensorOp>(
+          loc, f32Type, output, /*restrict=*/true, /*writable=*/true);
+    } else {
+      auto mLoop = rewriter.create<scf::ForOp>(
+          loc, zero, mEnd, mStep, ValueRange{c},
+          [&](OpBuilder &mBuilder, Location, Value m, ValueRange mAcc) {
+            auto nLoop = mBuilder.create<scf::ForOp>(
+                loc, zero, nEnd, nStep, mAcc,
+                [&](OpBuilder &nBuilder, Location, Value n, ValueRange nAcc) {
+                  Value tile = computeTile(nBuilder, m, n, nAcc[0]);
+                  SmallVector<OpFoldResult> offsets{m, n};
+                  SmallVector<OpFoldResult> sizes{nBuilder.getIndexAttr(tileM),
+                                                  nBuilder.getIndexAttr(tileN)};
+                  SmallVector<OpFoldResult> strides(2,
+                                                    nBuilder.getIndexAttr(1));
+                  Value result = nBuilder.create<tensor::InsertSliceOp>(
+                      loc, tile, nAcc[0], offsets, sizes, strides);
+                  nBuilder.create<scf::YieldOp>(loc, result);
+                });
+            mBuilder.create<scf::YieldOp>(loc, nLoop.getResults());
+          });
+      result = mLoop.getResult(0);
+    }
     if (result.getType() != dstType) {
       auto trunc = rewriter.create<arith::TruncFOp>(loc, dstType, result);
       trunc->setAttr("round_mode",

@@ -1,4 +1,5 @@
-// RUN: triton-opt --triton-to-linalg="named-ops=True" --split-input-file %s | FileCheck %s
+// RUN: triton-opt --triton-to-linalg="named-ops=True compile-on-910-95=true" --split-input-file %s | FileCheck %s --check-prefixes=CHECK,A5
+// RUN: triton-opt --triton-to-linalg="named-ops=True compile-on-910-95=false" --split-input-file %s | FileCheck %s --check-prefixes=CHECK,A3
 
 // Mixed FP4/FP8 must decode the packed bytes before scale/NaN processing.
 // CHECK-LABEL: func.func @mixed_fp4_fp8
@@ -87,7 +88,10 @@ func.func @batched_fp4(%a: tensor<2x16x16xi8>, %b: tensor<2x16x32xi8>, %sa: tens
 // CHECK: tensor.extract_slice {{.*}} : tensor<256x128xi8> to tensor<32x16xi8>
 // CHECK: linalg.matmul {{.*}}input_precision = "ieee"
 // CHECK-SAME: tensor<32x32xf32>, tensor<32x32xf32>
-// CHECK: tensor.insert_slice
+// A5: tensor.insert_slice
+// A3: memref.subview
+// A3: bufferization.materialize_in_destination
+// A3: bufferization.to_tensor
 // CHECK-NOT: tt.dot_scaled
 func.func @large_non_k_packed(%a: tensor<64x256xi8>, %b: tensor<256x128xi8>, %sa: tensor<128x8xi8>, %sb: tensor<256x8xi8>, %c: tensor<128x256xf32>) -> tensor<128x256xf32> {
   %d = tt.dot_scaled %a scale %sa, %b scale %sb, %c lhs = e2m1 rhs = e2m1 {fastMath = false, lhs_k_pack = false, rhs_k_pack = false} : tensor<64x256xi8>, tensor<128x8xi8> * tensor<256x128xi8>, tensor<256x8xi8> -> tensor<128x256xf32>
