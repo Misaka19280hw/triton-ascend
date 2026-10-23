@@ -182,6 +182,26 @@ def test_c_api_invalid_grid_is_rejected_before_submission(native_api, config, gr
         assert message in error.value
 
 
+def test_c_api_releases_workspace_when_execution_preparation_fails(native_api):
+    import torch
+
+    # Overflow lock sizing after acquiring a small workspace, before any CANN
+    # kernel call. Exercise exception cleanup without submitting an invalid
+    # device kernel or exhausting memory.
+    with plan(native_api, [], workspace_size=65536, ordered_locks=2**63) as handle:
+        req = request()
+        req.grid[:] = (1, 1, 1)
+        req.stream = driver.NPUDriver().get_current_stream()
+        error = ct.create_string_buffer(256)
+        torch.npu.synchronize()
+        before = torch.npu.memory_allocated()
+        for _ in range(8):
+            ret = native_api.triton_npu_launch_v1(handle, ct.byref(req), None, None, 0, error, len(error))
+            assert ret == -1
+            assert b"size overflow" in error.value
+        assert torch.npu.memory_allocated() == before
+
+
 def test_c_api_request_version_and_bounded_error(native_api):
     with plan(native_api, []) as handle:
         req = request()
@@ -301,3 +321,33 @@ def test_c_api_rejects_conflicting_program_grid_configuration(native_api, flags,
     handle = native_api.triton_npu_create_plan_v1(ct.byref(config), None, 0, error, len(error))
     assert not handle
     assert error.value
+
+
+@pytest.mark.parametrize("factor", [2, 4, 8, 16, 32])
+def test_c_api_accepts_dynamic_dot_row_configuration(native_api, factor):
+    with plan(native_api, [launcher.POINTER], flags=launcher.DOT_ROW | launcher.COALESCE_CEIL, coalesce_factor=factor,
+              coalesce_axis=0):
+        pass
+
+
+@pytest.mark.parametrize("changes", [
+    {"coalesce_factor": 1},
+    {"coalesce_factor": 3},
+    {"coalesce_factor": 64},
+    {"coalesce_axis": -1},
+    {"coalesce_axis": 1},
+    {"coalesce_axis": 2},
+    {"flags": launcher.DOT_ROW},
+    {"flags": launcher.DOT_ROW | launcher.COALESCE_CEIL | launcher.IAT},
+    {"flags": launcher.DOT_ROW | launcher.COALESCE_CEIL | launcher.PTSM},
+])
+def test_c_api_rejects_invalid_dynamic_dot_row_configuration(native_api, changes):
+    config = spec()
+    config.flags = launcher.DOT_ROW | launcher.COALESCE_CEIL
+    config.coalesce_factor, config.coalesce_axis = 8, 0
+    for field, value in changes.items():
+        setattr(config, field, value)
+    error = ct.create_string_buffer(256)
+    handle = native_api.triton_npu_create_plan_v1(ct.byref(config), None, 0, error, len(error))
+    assert not handle
+    assert b"invalid dynamic DotRow configuration" in error.value
