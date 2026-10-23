@@ -60,6 +60,19 @@ def _mixed_argument_echo(out, small, fractional, source, short, wide, BIAS: tl.c
 
 
 @triton.jit
+def _folded_argument_echo(out, first, middle, last, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    # Bound all writes even with an incorrect grid read from a broken launcher.
+    active = (pid < 3) & (tl.program_id(1) == 0) & (tl.program_id(2) == 0)
+    tl.store(out + pid * 6 + 0, first, active)
+    tl.store(out + pid * 6 + 1, middle, active)
+    tl.store(out + pid * 6 + 2, last + BLOCK, active)
+    tl.store(out + pid * 6 + 3, tl.num_programs(0), active)
+    tl.store(out + pid * 6 + 4, tl.num_programs(1), active)
+    tl.store(out + pid * 6 + 5, tl.num_programs(2), active)
+
+
+@triton.jit
 def _grid_echo(out):
     x = tl.program_id(0)
     y = tl.program_id(1)
@@ -158,6 +171,48 @@ def test_mixed_scalar_abi_matches_device_and_c_entry(unsigned):
               [ctypes.c_void_p(output.data_ptr()), *(kind(value) for kind, value in zip(ctypes_types, values))])
     torch.npu.synchronize()
     assert output.cpu().tolist() == values
+
+
+@pytest.mark.parametrize("taskqueue", [False, True])
+@pytest.mark.parametrize("folded", ["first", "last"])
+def test_value_folded_arguments_preserve_values_and_grid(monkeypatch, tmp_path, taskqueue, folded):
+    monkeypatch.setenv("TRITON_ENABLE_TASKQUEUE", str(taskqueue))
+    # Match Inductor: a folded scalar stays i32, and a tile constexpr is absent
+    # from the signature altogether. Folding must precede ABI layout creation.
+    signature = {"out": "*i32", "first": "i32", "middle": "i32", "last": "i32"}
+    # ASTSource.hash() currently omits constant keys, so isolate specializations
+    # that fold the same value at different argument positions.
+    with triton.knobs.cache.scope():
+        triton.knobs.cache.dir = str(tmp_path / "cache")
+        compiled = triton.compile(
+            ASTSource(_folded_argument_echo, signature=signature, constexprs={folded: 196, "BLOCK": 8}))
+    values = {"first": 5, "middle": 7, "last": 11}
+    values[folded] = 196
+    output = torch.full((3, 6), -1, dtype=torch.int32, device="npu")
+    expected = [[values["first"], values["middle"], values["last"] + 8, 3, 1, 1]] * 3
+    instance = _native(compiled)
+    args = (output, *values.values())
+    grid = (3, 1, 1)
+    _run(instance, compiled, args, grid=grid)
+    torch.npu.synchronize()
+    assert output.cpu().tolist() == expected
+
+    output.fill_(-2)
+    module_spec = importlib.util.spec_from_file_location("__triton_launcher", instance.get_launcher_so_path())
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    module.launch(*grid,
+                  driver.NPUDriver().get_current_stream(), compiled.function, compiled.packed_metadata, None, None,
+                  None, *args)
+    torch.npu.synchronize()
+    assert output.cpu().tolist() == expected
+
+    output.fill_(-3)
+    _c_launch(instance, compiled, [
+        ctypes.c_void_p(output.data_ptr()), *(ctypes.c_int32(value) for name, value in values.items() if name != folded)
+    ], grid=grid)
+    torch.npu.synchronize()
+    assert output.cpu().tolist() == expected
 
 
 @pytest.mark.parametrize("taskqueue", [False, True])
@@ -292,28 +347,105 @@ def test_multiple_signatures_share_runtime():
     assert grid_out.item() == 0
 
 
-@pytest.mark.parametrize("taskqueue", [False, True])
-def test_cube_vector_workspace(monkeypatch, record_property, taskqueue):
+def _workspace_case(seed=11):
     from test_workspace_usage import matmul_mul_kernel
 
-    monkeypatch.setenv("TRITON_ENABLE_TASKQUEUE", str(taskqueue))
     # Integer-valued fp16 inputs give an exact CPU oracle. A2 emits a nonzero
     # workspace requirement; CANN on 950 may omit the workspace callback.
-    generator = torch.Generator().manual_seed(11)
+    generator = torch.Generator().manual_seed(seed)
     m, n, k = 256, 192, 32
     a, b, c = [torch.randint(-2, 3, shape, generator=generator).half() for shape in ((m, k), (k, n), (m, n))]
     expected = (a.float() @ b.float() * c.float()).half()
     a, b, c = (value.npu() for value in (a, b, c))
     out = torch.empty_like(c)
-    compiled = matmul_mul_kernel[(4, 3)](a, b, c, out, m, n, k, *a.stride(), *b.stride(), *c.stride(), *out.stride(),
-                                         BLOCK_M=64, BLOCK_N=64, BLOCK_K=32)
-    torch.npu.synchronize()
+    args = (a, b, c, out, m, n, k, *a.stride(), *b.stride(), *c.stride(), *out.stride())
+    compiled = matmul_mul_kernel.warmup(*args, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32, grid=(4, 3))
+    compiled._init_handles()
     workspace = getattr(compiled.metadata, "workspace_size", 0)
     if not compiled.metadata.compile_on_910_95:
         assert workspace > 0
-    assert _native(compiled).launch_spec.workspace_size == max(workspace, 0)
+    return compiled, (*args, 64, 64, 32), expected
+
+
+@pytest.mark.parametrize("taskqueue", [False, True])
+def test_cube_vector_workspace(monkeypatch, record_property, taskqueue):
+    monkeypatch.setenv("TRITON_ENABLE_TASKQUEUE", str(taskqueue))
+    compiled, args, expected = _workspace_case()
+    instance = _native(compiled)
+    workspace = getattr(compiled.metadata, "workspace_size", 0)
+    assert instance.launch_spec.workspace_size == max(workspace, 0)
     record_property("workspace_bytes_per_block", workspace)
-    assert torch.equal(out.cpu(), expected)
+    _run(instance, compiled, args, grid=(4, 3, 1))
+    torch.npu.synchronize()
+    assert torch.equal(args[3].cpu(), expected)
+
+
+def _workspace_instance(compiled):
+    from types import SimpleNamespace
+
+    # Exercise host ownership on 950 too, even when its device binary does not
+    # consume workspace. The non-SIMT ABI always reserves the workspace slot.
+    metadata = compiled.metadata._asdict()
+    metadata["workspace_size"] = max(metadata.get("workspace_size", 0), 65536)
+    return driver.NPULauncher(compiled.src, SimpleNamespace(**metadata))
+
+
+@pytest.mark.parametrize("taskqueue", [False, True])
+@pytest.mark.parametrize("sync_each", [False, True])
+def test_workspace_is_released_after_execution(monkeypatch, record_property, taskqueue, sync_each):
+    monkeypatch.setenv("TRITON_ENABLE_TASKQUEUE", str(taskqueue))
+    compiled, args, expected = _workspace_case()
+    instance = _workspace_instance(compiled)
+    record_property("device_workspace_bytes_per_block", getattr(compiled.metadata, "workspace_size", 0))
+    record_property("launch_workspace_bytes_per_block", instance.launch_spec.workspace_size)
+    _run(instance, compiled, args, grid=(4, 3, 1))
+    torch.npu.synchronize()
+    before = torch.npu.memory_allocated()
+    for _ in range(64):
+        _run(instance, compiled, args, grid=(4, 3, 1))
+        if sync_each:
+            torch.npu.synchronize()
+    torch.npu.synchronize()
+    after = torch.npu.memory_allocated()
+    record_property("retained_workspace_growth_bytes", after - before)
+    assert torch.equal(args[3].cpu(), expected)
+    # Allow minor framework bookkeeping, but not one workspace per invocation.
+    # Check active allocations rather than allocator-reserved memory.
+    assert after <= before + 1024**2
+
+
+def test_workspace_streams_and_queued_plan_ownership(monkeypatch, record_property):
+    monkeypatch.setenv("TRITON_ENABLE_TASKQUEUE", "true")
+    streams = [torch.npu.Stream(), torch.npu.Stream()]
+    cases, instances = [], []
+    for index, stream in enumerate(streams):
+        compiled, args, expected = _workspace_case(seed=11 + index)
+        with torch.npu.stream(stream):
+            stream_id = driver.NPUDriver().get_current_stream()
+        cases.append((compiled, args, expected, stream_id))
+        instances.append(_workspace_instance(compiled))
+    torch.npu.synchronize()
+    for instance, (compiled, args, _, stream_id) in zip(instances, cases):
+        _run(instance, compiled, args, grid=(4, 3, 1), stream=stream_id)
+    torch.npu.synchronize()
+    before = torch.npu.memory_allocated()
+    for _ in range(32):
+        for instance, (compiled, args, _, stream_id) in zip(instances, cases):
+            # Submit from the default stream's context to explicit, distinct
+            # launch streams. Workspace reuse must follow the launch stream.
+            _run(instance, compiled, args, grid=(4, 3, 1), stream=stream_id)
+        scratch = torch.empty(65536 * 12, dtype=torch.uint8, device="npu")
+        scratch.fill_(165)
+        del scratch
+    del instance
+    instances.clear()
+    gc.collect()
+    torch.npu.synchronize()
+    after = torch.npu.memory_allocated()
+    record_property("retained_workspace_growth_bytes", after - before)
+    for _, args, expected, _ in cases:
+        assert torch.equal(args[3].cpu(), expected)
+    assert after <= before + 1024**2
 
 
 @triton.jit
@@ -359,6 +491,7 @@ def _original_grid_echo(out, original_x, original_y):
     [(1, 16, False)],
     [(0, 64, True)],
     [(1, 16, False), (0, 4, True)],
+    *[[(0, factor, False)] for factor in (2, 4, 8, 16, 32)],
 ])
 def test_dynamic_original_grid_abi_reaches_both_entries(monkeypatch, taskqueue, sequence):
     from types import SimpleNamespace
@@ -384,9 +517,12 @@ def test_dynamic_original_grid_abi_reaches_both_entries(monkeypatch, taskqueue, 
     instance = driver.NPULauncher(source, metadata)
     output = torch.full((5, ), -1, dtype=torch.int32, device="npu")
     # Reuse one plan and one exported stub for changing, non-divisible grids.
-    for grid in [(1, 1, 1), (4097, 17, 3), (129, 65, 1)]:
+    # Keep the largest transformed launch below legacy CANN's 65535-block
+    # limit: ceil(2049 / 2) * 17 * 3 == 52275 for DotRow factor=2.
+    for grid in [(1, 1, 1), (2049, 17, 3), (129, 65, 1)]:
         transformed = apply_program_grid_transforms(grid, contract,
                                                     physical_core_count=instance.launch_spec.physical_blocks)
+        assert transformed[0] * transformed[1] * transformed[2] <= 65535
         expected = [*grid[:2], *transformed]
         output.fill_(-1)
         _run(instance, compiled, (output, ), grid=grid)
@@ -396,3 +532,63 @@ def test_dynamic_original_grid_abi_reaches_both_entries(monkeypatch, taskqueue, 
         _c_launch(instance, compiled, [ctypes.c_void_p(output.data_ptr())], grid=grid)
         torch.npu.synchronize()
         assert output.cpu().tolist() == expected
+
+
+@triton.jit
+def _dynamic_dot_rows(a, b, out, steps):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, 16)[:, None] * 16 + tl.arange(0, 16)[None, :]
+    lhs = tl.load(a + row * 256 + offsets)
+    acc = tl.full((16, 16), 0, tl.float32)
+    for step in range(steps):
+        rhs = tl.load(b + step * 256 + offsets)
+        acc = tl.dot(lhs, rhs, acc)
+    tl.store(out + row * 256 + offsets, acc)
+
+
+@pytest.mark.parametrize("taskqueue", [False, True])
+def test_compiler_dynamic_dot_row_launch(monkeypatch, taskqueue):
+    from triton.backends.ascend.program_grid import normalize_program_grid_transforms
+    from triton.backends.ascend.utils import is_compile_on_910_95
+    if not is_compile_on_910_95(triton.runtime.driver.active.get_current_target().arch):
+        pytest.skip("compiler DotRow mapping requires Ascend 950")
+    monkeypatch.setenv("TRITON_ENABLE_TASKQUEUE", str(taskqueue))
+    # Compile without a static grid hint so the real compiler inserts the
+    # original-grid ABI and tail masks. No metadata or signatures are replaced.
+    compiled = triton.compile(
+        ASTSource(_dynamic_dot_rows, signature={"a": "*fp16", "b": "*fp16", "out": "*fp32", "steps": "i32"},
+                  constexprs={}), options={"rule_mask": 8})
+    assert compiled.metadata.program_grid_mapping_applied
+    assert not compiled.metadata.row_coalescing_applied
+    contract = normalize_program_grid_transforms(compiled.metadata.program_grid_transforms)
+    assert [(t["axis"], t["factor"], t["persistent_coverage"]) for t in contract["transforms"]] == [(0, 8, False)]
+    instance = _native(compiled)
+    steps = 3
+    b_cpu = (torch.arange(steps * 256).reshape(steps, 16, 16) % 5 - 2).float()
+    b = b_cpu.to(device="npu", dtype=torch.float16)
+    for rows in (1, 7, 8, 9, 65):
+        # Guard rows make an unmasked final group observable without writing
+        # outside the allocation. Small integer inputs have an exact reference.
+        a_cpu = (torch.arange((rows + 8) * 256).reshape(rows + 8, 16, 16) % 7 - 3).float()
+        a = a_cpu.to(device="npu", dtype=torch.float16)
+        expected = a_cpu[:rows] @ b_cpu.sum(0)
+        out = torch.full((rows + 8, 16, 16), -777., device="npu")
+        for c_entry in (False, True):
+            out.fill_(-777.)
+            if not taskqueue:
+                # Direct CANN submission bypasses PyTorch's host queue. Finish
+                # input/sentinel initialization before testing the DotRow ABI.
+                torch.npu.synchronize()
+            if c_entry:
+                _c_launch(instance, compiled, [
+                    ctypes.c_void_p(a.data_ptr()),
+                    ctypes.c_void_p(b.data_ptr()),
+                    ctypes.c_void_p(out.data_ptr()),
+                    ctypes.c_int32(steps)
+                ], grid=(rows, 1, 1))
+            else:
+                _run(instance, compiled, (a, b, out, steps), grid=(rows, 1, 1))
+            torch.npu.synchronize()
+            actual = out.cpu()
+            assert torch.equal(actual[:rows], expected)
+            assert torch.all(actual[rows:] == -777.)

@@ -40,8 +40,12 @@ from triton.backends.ascend import launcher, utils
 def cache_configuration_scope():
     from triton import knobs
     # Attribute overrides and environment changes both belong to this test.
-    with knobs.cache.scope():
-        yield
+    launcher._runtime_sources.cache_clear()
+    try:
+        with knobs.cache.scope():
+            yield
+    finally:
+        launcher._runtime_sources.cache_clear()
 
 
 def metadata(**changes):
@@ -109,6 +113,26 @@ def test_empty_and_constexpr_arguments():
                                                                       (launcher.BF16, -1)]
 
 
+@pytest.mark.parametrize("signature,constants,expected", [
+    ({0: "*fp32", 1: "i32", 2: "i32"}, {(1, ): 196}, ["*fp32", "constexpr", "i32"]),
+    ({0: "*fp32", 1: "i32", 2: "i32"}, {(2, ): 196, (3, ): 64, (4, ): 196}, ["*fp32", "i32", "constexpr"]),
+    ({0: "*fp32", 2: "i32"}, {(1, ): 64}, ["*fp32", "i32"]),
+    ({0: ("i32", "i32"), 1: "constexpr"}, {(1, ): 64}, ["i32", "i32", "constexpr"]),
+    ({0: ("i32", ("i32", "*fp32")), 1: "i32"}, {(0, 1, 0): 196}, ["i32", "constexpr", "*fp32", "i32"]),
+    ({0: ("i32", "i32"), 1: "i32"}, {(0, ): (3, 7)}, ["constexpr", "constexpr", "i32"]),
+])
+def test_folded_arguments_use_original_paths(signature, constants, expected):
+    assert launcher.argument_types(signature, constants) == launcher.argument_types(dict(enumerate(expected)))
+
+
+@pytest.mark.parametrize("folded_type", ["constexpr", "i32"])
+def test_folded_argument_after_descriptor_preserves_descriptor_fields(folded_type):
+    signature = {0: "tensordesc<fp32[16,32]>", 1: folded_type, 2: "i32"}
+    types = launcher.argument_types(signature, {(1, ): 196, (3, ): 64})
+    descriptor = launcher.argument_types({0: signature[0]})
+    assert types == [*descriptor, (launcher.CONSTEXPR, -1), (launcher.I32, -1)]
+
+
 def test_nested_descriptor_and_tuple_expansion():
     signature = {0: ("i32", ("tensordesc<fp32[16,32]>", "constexpr")), 1: "*fp32"}
     descriptor = SimpleNamespace(base=1234, shape=(16, 32), strides=(32, 1), padding="nan")
@@ -145,31 +169,43 @@ def test_export_path_is_lazy_and_cached(policy, monkeypatch):
     assert len(calls) == 1
 
 
-def test_runtime_cache_tracks_headers_build_inputs_and_root(tmp_path, monkeypatch):
+@pytest.mark.parametrize("name,filename", [("__triton_launcher_runtime", "launcher_runtime.cpp"),
+                                           ("launcher_export", "launcher_export.cpp")])
+def test_runtime_cache_tracks_headers_build_inputs_and_root(tmp_path, monkeypatch, name, filename):
     compiled = []
     build_inputs = {"compiler": "toolchain-a"}
-    monkeypatch.setattr(utils, "npu_extension_fingerprint", lambda *a, **k: dict(build_inputs))
+    monkeypatch.setattr(utils, "npu_extension_fingerprint",
+                        lambda *a, **k: {**build_inputs, "flags": list(k["extra_cflags"])})
 
     def build(name, source, **kwargs):
         path = Path(source).with_suffix(".so")
-        path.write_bytes(b"a compiled module")
+        path.write_bytes(repr(tuple(kwargs["extra_cflags"])).encode())
         compiled.append(source)
         return str(path)
 
     monkeypatch.setattr(utils, "_build_npu_ext", build)
     monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "cache-a"))
-    sources = {"launcher_runtime.cpp": "#include \"contract.h\"", "contract.h": "v1"}
-    first = launcher._build_shared("__triton_launcher_runtime", sources)
-    assert launcher._build_shared("__triton_launcher_runtime", sources) == first
+    sources = {filename: "#include \"contract.h\"", "contract.h": "v1"}
+    configured_flags = launcher._LAUNCHER_CFLAGS
+    assert configured_flags == ("-O2", )
+    first = launcher._build_shared(name, sources)
+    assert Path(first).read_bytes() == repr(configured_flags).encode()
+    assert launcher._build_shared(name, sources) == first
     assert len(compiled) == 1
-    changed = launcher._build_shared("__triton_launcher_runtime", {**sources, "contract.h": "v2"})
+    monkeypatch.setattr(launcher, "_LAUNCHER_CFLAGS", ("-O3", ))
+    other_level = launcher._build_shared(name, sources)
+    assert other_level != first
+    assert Path(other_level).read_bytes() == repr(("-O3", )).encode()
+    monkeypatch.setattr(launcher, "_LAUNCHER_CFLAGS", configured_flags)
+    assert launcher._build_shared(name, sources) == first
+    changed = launcher._build_shared(name, {**sources, "contract.h": "v2"})
     assert changed != first
     build_inputs["compiler"] = "toolchain-b"
-    assert launcher._build_shared("__triton_launcher_runtime", sources) != first
+    assert launcher._build_shared(name, sources) != first
     monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "cache-b"))
-    relocated = launcher._build_shared("__triton_launcher_runtime", sources)
+    relocated = launcher._build_shared(name, sources)
     assert str(tmp_path / "cache-b") in relocated
-    assert len(compiled) == 4
+    assert len(compiled) == 5
 
 
 @pytest.fixture
@@ -209,8 +245,28 @@ def prepared_backend(tmp_path, monkeypatch):
     return SimpleNamespace(driver=driver, root=source_dir, builds=builds, fingerprint=fingerprint, src=src)
 
 
-def test_helper_optimization_flags_invalidate_cached_artifact(prepared_backend, monkeypatch):
-    """An optimized helper must not reuse the earlier unoptimized binary."""
+@pytest.mark.parametrize("constant_key", ["folded", 1, (1, )])
+@pytest.mark.parametrize("named_signature", [False, True])
+def test_folded_arguments_reach_runtime_and_export(prepared_backend, monkeypatch, constant_key, named_signature):
+    state = prepared_backend
+    names = ["out", "folded", "tail"]
+    signature = dict(zip(names if named_signature else range(3), ["*i32", "i32", "i32"]))
+    src = SimpleNamespace(signature=signature, constants={constant_key: 196}, fn=SimpleNamespace(arg_names=names))
+    exported = []
+    monkeypatch.setattr(state.driver, "export_launcher",
+                        lambda spec, types, *args: exported.append(types) or "/export.so")
+    instance = state.driver.NPULauncher(src, metadata())
+    expected = launcher.argument_types({0: "*i32", 1: "constexpr", 2: "i32"})
+    assert instance.launch.types == expected
+    assert instance.get_launcher_so_path() == "/export.so"
+    assert exported == [expected]
+    assert src.signature == signature
+    assert instance.signature == {0: "*i32", 1: "i32", 2: "i32"}
+
+
+@pytest.mark.parametrize("previous_flags", [(), ("-O3", )])
+def test_helper_optimization_flags_invalidate_cached_artifact(prepared_backend, monkeypatch, previous_flags):
+    """Changing optimization must not reuse an artifact built with old flags."""
     state = prepared_backend
     build_flags = []
 
@@ -226,21 +282,33 @@ def test_helper_optimization_flags_invalidate_cached_artifact(prepared_backend, 
     monkeypatch.setattr(utils, "npu_extension_fingerprint", fingerprint)
     monkeypatch.setattr(state.driver, "_build_npu_ext", build)
     configured_flags = state.driver._NPU_UTILS_CFLAGS
-    assert configured_flags == ("-O3", )
-    monkeypatch.setattr(state.driver, "_NPU_UTILS_CFLAGS", ())
-    unoptimized = state.driver.NPUUtils().get_so_path()
+    assert configured_flags == ("-O2", )
+    monkeypatch.setattr(state.driver, "_NPU_UTILS_CFLAGS", previous_flags)
+    previous = state.driver.NPUUtils().get_so_path()
     monkeypatch.setattr(state.driver, "_NPU_UTILS_CFLAGS", configured_flags)
     optimized = state.driver.NPUUtils().get_so_path()
-    assert optimized != unoptimized
+    assert optimized != previous
     assert Path(optimized).read_bytes() == repr(configured_flags).encode()
     assert state.driver.NPUUtils().get_so_path() == optimized
-    assert build_flags == [(), configured_flags]
+    assert build_flags == [previous_flags, configured_flags]
 
 
 def test_repeated_preparation_reuses_keys_and_artifacts(prepared_backend, monkeypatch):
     state = prepared_backend
+    reads = []
+    read_text = Path.read_text
+
+    def read(path, *args, **kwargs):
+        if path.parent == state.root / "launcher_src":
+            reads.append(path.name)
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
     first = state.driver.NPULauncher(state.src, metadata())
     assert len(state.builds) == 2
+    first_reads = list(reads)
+    assert len(first_reads) == len(set(first_reads)) == 7
+    assert "launcher_export.cpp" not in first_reads
     hashes = []
     original_hash = hashlib.sha256
     monkeypatch.setattr(hashlib, "sha256", lambda *a, **kw: (hashes.append(a), original_hash(*a, **kw))[1])
@@ -252,24 +320,92 @@ def test_repeated_preparation_reuses_keys_and_artifacts(prepared_backend, monkey
     assert first.launch.spec["workspace_size"] == 0
     assert len(state.builds) == 2
     assert hashes == []
+    assert reads == first_reads
 
 
-def test_prepared_sources_and_build_options_invalidate(prepared_backend):
+def test_prepared_sources_are_fixed_but_build_options_invalidate(prepared_backend):
     state = prepared_backend
     first = state.driver.NPULauncher(state.src, metadata())
     header = state.root / "launcher_src/launcher_args.h"
     header.write_text(header.read_text() + "\n// changed layout source\n")
     second = state.driver.NPULauncher(state.src, metadata())
-    assert second._runtime_path != first._runtime_path
-    assert len(state.builds) == 3
+    assert second._runtime_path == first._runtime_path
+    assert len(state.builds) == 2
     (state.root / "npu_utils.cpp").write_text("helper source v2")
     third = state.driver.NPULauncher(state.src, metadata())
     assert third._runtime_path != second._runtime_path
-    assert len(state.builds) == 5  # New helper identity also changes the dependency config.
+    assert len(state.builds) == 4  # New helper identity also changes the dependency config.
     state.fingerprint["compiler"] = "toolchain-b"
     fourth = state.driver.NPULauncher(state.src, metadata())
     assert fourth._runtime_path != third._runtime_path
-    assert len(state.builds) == 7
+    assert len(state.builds) == 6
+
+
+def _runtime_sources_process(root, results):
+    launcher.__file__ = str(Path(root) / "launcher.py")
+    # A spawn child imports the backend afresh; do not clear a prewarmed cache.
+    assert launcher._runtime_sources.cache_info().currsize == 0
+    sources = launcher._runtime_sources()
+    results.put((dict(sources), launcher._shared_key("{}", tuple(sorted(sources.items())))))
+
+
+def test_runtime_source_edits_take_effect_in_a_new_process(prepared_backend):
+    state = prepared_backend
+    sources = launcher._runtime_sources()
+    old_key = launcher._shared_key("{}", tuple(sorted(sources.items())))
+    header = state.root / "launcher_src/launcher_args.h"
+    original = header.read_text()
+    identity = header.stat()
+    # No source stat shortcut: a new process must read same-sized modified text.
+    updated = original.replace("Copyright", "copyright", 1)
+    assert updated != original and len(updated) == len(original)
+    header.write_text(updated)
+    os.utime(header, ns=(identity.st_atime_ns, identity.st_mtime_ns))
+    assert launcher._runtime_sources() is sources
+    assert sources["launcher_args.h"] == original
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    child = context.Process(target=_runtime_sources_process, args=(str(state.root), results))
+    try:
+        child.start()
+        fresh_sources, fresh_key = results.get(timeout=90)
+        child.join(timeout=90)
+        assert child.exitcode == 0
+    finally:
+        if child.is_alive():
+            child.terminate()
+        child.join(timeout=10)
+    assert fresh_sources["launcher_args.h"] == updated
+    assert fresh_key != old_key
+
+
+def test_runtime_source_snapshot_is_read_only(prepared_backend):
+    sources = launcher._runtime_sources()
+    with pytest.raises(TypeError):
+        sources["launcher_args.h"] = "corrupted source"
+
+
+def test_runtime_source_read_failure_can_retry(prepared_backend, monkeypatch):
+    state = prepared_backend
+    header = state.root / "launcher_src/launcher_args.h"
+    read_text = Path.read_text
+    attempts = []
+
+    def read(path, *args, **kwargs):
+        if path == header:
+            attempts.append(path)
+            if len(attempts) == 1:
+                raise OSError("temporary source read failure")
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    with pytest.raises(OSError, match="temporary source read failure"):
+        state.driver.NPULauncher(state.src, metadata())
+    assert len(state.builds) == 1  # Only the helper was built before the failure.
+    first = state.driver.NPULauncher(state.src, metadata())
+    assert state.driver.NPULauncher(state.src, metadata())._runtime_path == first._runtime_path
+    assert len(state.builds) == 2
+    assert len(attempts) == 2
 
 
 @pytest.mark.parametrize("setting", ["TRITON_CACHE_DIR", "TRITON_HOME", "knob"])
@@ -391,7 +527,7 @@ def test_preparation_preserves_existing_content_keys(prepared_backend):
     source = (state.root / "npu_utils.cpp").read_text()
     expected = hashlib.sha256(json.dumps([source, state.fingerprint], sort_keys=True).encode()).hexdigest()
     assert state.driver.NPUUtils().get_so_path() == get_cache_manager(expected).get_file("npu_utils.so")
-    sources = launcher._runtime_sources(launcher._runtime_source_identity())
+    sources = launcher._runtime_sources()
     config = launcher._runtime_config(launcher._cache_relative(state.driver.NPUUtils().get_so_path()),
                                       utils.backend_policy, None)
     key = hashlib.sha256(json.dumps([state.fingerprint, {**sources, **config}], sort_keys=True).encode()).hexdigest()
@@ -541,11 +677,26 @@ def _grid_contract(sequence):
         ])
 
 
-@pytest.mark.parametrize("sequence,expected", [
+_PROGRAM_GRID_CASES = [
     ([(1, 16, False)], launcher.IAT),
     ([(0, 64, True)], launcher.PTSM),
     ([(1, 16, False), (0, 4, True)], launcher.IAT | launcher.PTSM),
-])
+    *[([(0, factor, False)], launcher.DOT_ROW | launcher.COALESCE_CEIL) for factor in (2, 4, 8, 16, 32)],
+]
+
+
+def test_program_grid_sequence_coverage():
+    from triton.backends.ascend.program_grid import _SUPPORTED_SEQUENCES
+    # A new compiler contract must be covered by the launcher mapping and
+    # native grid/ABI checks below; do not silently leave a sequence untested.
+    assert {
+        tuple((axis, factor, persistent, persistent)
+              for axis, factor, persistent in sequence)
+        for sequence, _ in _PROGRAM_GRID_CASES
+    } == _SUPPORTED_SEQUENCES
+
+
+@pytest.mark.parametrize("sequence,expected", _PROGRAM_GRID_CASES)
 @pytest.mark.parametrize("as_json", [False, True])
 def test_program_grid_plan_modes(policy, sequence, expected, as_json):
     contract = _grid_contract(sequence)
@@ -553,9 +704,10 @@ def test_program_grid_plan_modes(policy, sequence, expected, as_json):
         metadata(program_grid_mapping_applied=True,
                  program_grid_transforms=json.dumps(contract) if as_json else contract,
                  ptsm_cap_authorized=any(t[2] for t in sequence)), policy)
-    assert spec.flags & (launcher.IAT | launcher.PTSM) == expected
+    assert spec.flags & (launcher.IAT | launcher.PTSM | launcher.DOT_ROW | launcher.COALESCE_CEIL) == expected
     assert not spec.flags & launcher.AUTO_MAP
-    assert (spec.coalesce_factor, spec.coalesce_axis) == (1, -1)
+    factor, axis = (sequence[0][1], 0) if expected & launcher.DOT_ROW else (1, -1)
+    assert (spec.coalesce_factor, spec.coalesce_axis) == (factor, axis)
 
 
 @pytest.mark.parametrize(
@@ -599,7 +751,7 @@ def test_program_grid_rejects_unsafe_mapping_combinations(policy, changes, error
 @pytest.mark.parametrize("blacklisted", [False, True])
 @pytest.mark.parametrize("auto_blockify", [False, True])
 @pytest.mark.parametrize("pure_simt", [False, True])
-@pytest.mark.parametrize("mapping", ["none", "row", "iat"])
+@pytest.mark.parametrize("mapping", ["none", "row", "iat", "dot_row"])
 def test_block_cap_follows_compiler_decision(policy, monkeypatch, auto_map, blacklisted, auto_blockify, pure_simt,
                                              mapping):
     # The runtime policy may differ from the one used to compile a cached
@@ -611,10 +763,13 @@ def test_block_cap_follows_compiler_decision(policy, monkeypatch, auto_map, blac
         fields.update(row_coalescing_applied=True, coalesce_factor=4, coalesce_axis=0, coalesce_grid_ceil_div=True)
     elif mapping == "iat":
         fields.update(program_grid_mapping_applied=True, program_grid_transforms=_grid_contract([(1, 16, False)]))
+    elif mapping == "dot_row":
+        fields.update(program_grid_mapping_applied=True, program_grid_transforms=_grid_contract([(0, 8, False)]))
     spec = launcher.make_launch_spec(metadata(**fields), policy)
     assert bool(spec.flags & launcher.AUTO_MAP) == auto_blockify
     assert bool(spec.flags & launcher.IAT) == (mapping == "iat")
-    assert bool(spec.flags & launcher.COALESCE_CEIL) == (mapping == "row")
+    assert bool(spec.flags & launcher.DOT_ROW) == (mapping == "dot_row")
+    assert bool(spec.flags & launcher.COALESCE_CEIL) == (mapping in ("row", "dot_row"))
     assert spec.physical_blocks == 40
 
 
@@ -633,17 +788,14 @@ def native_grid_probe(tmp_path_factory):
     return output
 
 
-@pytest.mark.parametrize("sequence,mode", [
-    ([(1, 16, False)], launcher.IAT),
-    ([(0, 64, True)], launcher.PTSM),
-    ([(1, 16, False), (0, 4, True)], launcher.IAT | launcher.PTSM),
-])
+@pytest.mark.parametrize("sequence,mode", _PROGRAM_GRID_CASES)
 @pytest.mark.parametrize("auto_map", [False, True])
 def test_native_grid_matches_compiler_reference(native_grid_probe, sequence, mode, auto_map):
     import random
     import subprocess
     from triton.backends.ascend.program_grid import apply_program_grid_transforms
     contract = _grid_contract(sequence)
+    factor, axis = (sequence[0][1], 0) if mode & launcher.DOT_ROW else (1, -1)
     rng = random.Random(2109)
     grids = [(1, 1, 1), (4097, 17, 3), (65, 33, 1), (2147483647, 1, 1)]
     grids += [tuple(rng.randint(1, n) for n in (32768, 128, 4)) for _ in range(32)]
@@ -651,9 +803,12 @@ def test_native_grid_matches_compiler_reference(native_grid_probe, sequence, mod
         for grid in grids:
             flags = mode | (launcher.AUTO_MAP if auto_map else 0)
             values = [
-                int(v)
-                for v in subprocess.check_output([str(
-                    native_grid_probe), str(flags), str(physical), *map(str, grid)], text=True).split()
+                int(v) for v in subprocess.check_output(
+                    [str(native_grid_probe),
+                     str(flags),
+                     str(physical), *map(str, grid),
+                     str(factor),
+                     str(axis)], text=True).split()
             ]
             expected = apply_program_grid_transforms(grid, contract, physical_core_count=physical)
             logical = expected[0] * expected[1] * expected[2]
@@ -661,7 +816,9 @@ def test_native_grid_matches_compiler_reference(native_grid_probe, sequence, mod
             # lock/workspace, pointer, i8, padding, original X/Y, final X/Y/Z,
             # padding, debug pointer: exact ABI offsets, independent of grid.
             assert values[5:] == [24, 28, 36, 48, 56]
-    values = subprocess.check_output([str(native_grid_probe), str(mode), "40", "0", "17", "3"], text=True)
+    values = subprocess.check_output(
+        [str(native_grid_probe), str(mode), "40", "0", "17", "3",
+         str(factor), str(axis)], text=True)
     assert list(map(int, values.split()))[:5] == [0, 17, 3, 0, 0]
 
 
