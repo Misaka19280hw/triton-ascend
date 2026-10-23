@@ -181,26 +181,17 @@ def test_scaled_dot_fast_math(normal_type):
         tl.store(out_ptr, out_tensor.to(a.dtype))
 
     def make_scale_tensor(scale, data_dtype):
-        if data_dtype == torch.bfloat16:
-            scale_i16 = scale.to(torch.int16)
-            return (scale_i16 << 7).view(torch.bfloat16)
-        scale_fp32 = (scale.to(torch.int32) << 23).view(torch.float32)
-        return scale_fp32.to(torch.float16)
+        # OCP E8M0 has no zero or infinity: 0 is 2^-127 and 255 is NaN.
+        bits = scale.to(torch.int32) << 23
+        bits = torch.where(scale.eq(0), torch.full_like(bits, 0x00400000), bits)
+        bits = torch.where(scale.eq(255), torch.full_like(bits, 0x7fc00000), bits)
+        return bits.view(torch.float32).to(data_dtype)
 
-    def golden_ref(x, scale_x, y, scale_y, fast_math):
+    def golden_ref(x, scale_x, y, scale_y):
         upscale_x = make_scale_tensor(scale_x.repeat_interleave(x.shape[1] // scale_x.shape[1], dim=1), x.dtype)
         scale_y_t = scale_y.T
         upscale_y = make_scale_tensor(scale_y_t.repeat_interleave(y.shape[0] // scale_y_t.shape[0], dim=0), y.dtype)
-        scaled_x = x * upscale_x
-        scaled_y = y * upscale_y
-
-        if not fast_math:
-            lhs_nan_mask = scale_x.eq(255).repeat_interleave(x.shape[1] // scale_x.shape[1], dim=1)
-            rhs_nan_mask = scale_y_t.eq(255).repeat_interleave(y.shape[0] // scale_y_t.shape[0], dim=0)
-            scaled_x = torch.where(lhs_nan_mask, torch.full_like(scaled_x, float("nan")), scaled_x)
-            scaled_y = torch.where(rhs_nan_mask, torch.full_like(scaled_y, float("nan")), scaled_y)
-
-        return torch.matmul(scaled_x, scaled_y)
+        return torch.matmul(x * upscale_x, y * upscale_y)
 
     dtype = torch.float16 if normal_type == "fp16" else torch.bfloat16
     x = torch.full((m, k), 2.0, dtype=dtype, device=device)
@@ -219,8 +210,10 @@ def test_scaled_dot_fast_math(normal_type):
     out_fast_math = run_kernel(True)
     out_precise = run_kernel(False)
 
-    ref_fast_math = golden_ref(x, scale_x, y, scale_y, fast_math=True)
-    ref_precise = golden_ref(x, scale_x, y, scale_y, fast_math=False)
+    # The TA half-precision software path preserves specification NaNs in
+    # both modes; fast_math does not require changing a NaN scale to infinity.
+    ref_fast_math = golden_ref(x, scale_x, y, scale_y)
+    ref_precise = golden_ref(x, scale_x, y, scale_y)
 
     assert torch.isnan(out_precise[3, :]).all()
     assert torch.isnan(out_precise[:, 5]).all()
