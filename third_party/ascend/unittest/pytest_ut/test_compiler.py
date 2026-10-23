@@ -12,7 +12,6 @@ import pytest
 import triton
 import triton.language as tl
 
-
 import triton.backends.ascend.compiler as compiler
 from triton._C.libtriton import ir
 from triton.backends.ascend import utils
@@ -173,6 +172,8 @@ def test_active_options_keep_explicit_values(backend):
     (tl.float8e4nv, False),
     (tl.float8e4b8, False),
     (tl.float8e5b16, False),
+    (tl.float8e4b15, False),
+    (tl.float8e4b15, True),
     (tl.float8e4b8, True),
     (tl.float8e5b16, True),
 ])
@@ -189,14 +190,15 @@ def test_fp8_dot_frontend_options(backend, dtype, deprecated):
     context = ir.context()
     ir.load_dialects(context)
     backend.load_dialects(context)
-    warning = pytest.warns(UserWarning, match="upcasted to fp16") if deprecated else contextlib.nullcontext()
+    warning_message = "the use of fp8e4b15 is deprecated" if dtype == tl.float8e4b15 else "upcasted to fp16"
+    warning = pytest.warns(UserWarning, match=warning_message) if deprecated else contextlib.nullcontext()
     with warning:
         module = source.make_ir(backend.target, options, backend.get_codegen_implementation(options),
                                 backend.get_module_map(), context)
 
     assert module.verify()
     dot = next(line for line in str(module).splitlines() if "tt.dot " in line)
-    assert ("tensor<64x64xf16>" in dot) == deprecated
+    assert ("tensor<64x64xf16>" in dot) == (deprecated or dtype == tl.float8e4b15)
 
 
 def test_text_pipeline_uses_ttadapter_directly(backend, monkeypatch):
