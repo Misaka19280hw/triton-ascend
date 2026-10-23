@@ -2738,8 +2738,11 @@ static Value decomposeF32Dot(triton::DotOp op, Value a, Value b, Value c,
       Value bits = rewriter.create<arith::BitcastOp>(loc, bitsTy, value);
       Value magnitude =
           rewriter.create<arith::AndIOp>(loc, bits, constant(0x7fffffff));
+      // Both operands are nonnegative after clearing the sign bit. Signed
+      // comparison is exact and avoids A3's unsupported unsigned i32-to-i64
+      // promotion, including at the adjacent Inf/NaN bit patterns.
       Value special = rewriter.create<arith::CmpIOp>(
-          loc, arith::CmpIPredicate::uge, magnitude, constant(0x7f800000));
+          loc, arith::CmpIPredicate::sge, magnitude, constant(0x7f800000));
       Value rounded = bits;
       if (roundNearest)
         rounded = rewriter.create<arith::AddIOp>(loc, bits, constant(0x1000));
@@ -2778,8 +2781,10 @@ static Value decomposeF32Dot(triton::DotOp op, Value a, Value b, Value c,
         rounded = rewriter.create<arith::ShRUIOp>(loc, rounded, constant(16));
         Value magnitude =
             rewriter.create<arith::AndIOp>(loc, bits, constant(0x7fffffff));
+        // magnitude and the threshold fit signed i32, including the
+        // smallest NaN payload; no unsigned widening is needed on A3.
         Value isNaN = rewriter.create<arith::CmpIOp>(
-            loc, arith::CmpIPredicate::ugt, magnitude, constant(0x7f800000));
+            loc, arith::CmpIPredicate::sgt, magnitude, constant(0x7f800000));
         Value quietNaN =
             rewriter.create<arith::OrIOp>(loc, high, constant(0x40));
         rounded =

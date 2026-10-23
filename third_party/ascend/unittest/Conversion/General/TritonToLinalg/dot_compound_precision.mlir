@@ -1,9 +1,10 @@
-// RUN: triton-opt --triton-to-linalg="named-ops=True" --split-input-file %s | FileCheck %s
+// RUN: triton-opt --triton-to-linalg="named-ops=True" --split-input-file %s | FileCheck %s --implicit-check-not="arith.cmpi uge" --implicit-check-not="arith.cmpi ugt"
 
 // -----
 
 // CHECK-LABEL: func.func @tf32x3_matrix
 // CHECK-NOT: tt.dot
+// CHECK: arith.cmpi sge
 // CHECK-COUNT-3: linalg.matmul {{.*}}input_precision = "ieee"
 // CHECK: arith.addf
 // CHECK: return
@@ -18,6 +19,7 @@ func.func @tf32x3_matrix(%a: tensor<16x16xf32>, %b: tensor<16x16xf32>, %c: tenso
 // CHECK: scf.for
 // CHECK: tensor.extract_slice
 // CHECK-NOT: tt.dot
+// CHECK: arith.cmpi sge
 // CHECK-COUNT-3: linalg.matmul {{.*}}input_precision = "ieee"
 // CHECK: arith.addf
 // CHECK: return
@@ -30,6 +32,7 @@ func.func @tf32x3_batch(%a: tensor<2x16x16xf32>, %b: tensor<2x16x16xf32>, %c: te
 
 // CHECK-LABEL: func.func @bf16x3_matrix
 // CHECK-NOT: tt.dot
+// CHECK: arith.cmpi sgt
 // CHECK-COUNT-3: linalg.matmul {{.*}}input_precision = "ieee"
 // CHECK: arith.addf
 // CHECK: return
@@ -44,6 +47,7 @@ func.func @bf16x3_matrix(%a: tensor<16x16xf32>, %b: tensor<16x16xf32>, %c: tenso
 // CHECK: scf.for
 // CHECK: tensor.extract_slice
 // CHECK-NOT: tt.dot
+// CHECK: arith.cmpi sgt
 // CHECK-COUNT-3: linalg.matmul {{.*}}input_precision = "ieee"
 // CHECK: arith.addf
 // CHECK: return
@@ -56,6 +60,7 @@ func.func @bf16x3_batch(%a: tensor<2x16x16xf32>, %b: tensor<2x16x16xf32>, %c: te
 
 // CHECK-LABEL: func.func @bf16x6_matrix
 // CHECK-NOT: tt.dot
+// CHECK: arith.cmpi sgt
 // CHECK-COUNT-6: linalg.matmul {{.*}}input_precision = "ieee"
 // CHECK: arith.addf
 // CHECK: return
@@ -70,6 +75,7 @@ func.func @bf16x6_matrix(%a: tensor<16x16xf32>, %b: tensor<16x16xf32>, %c: tenso
 // CHECK: scf.for
 // CHECK: tensor.extract_slice
 // CHECK-NOT: tt.dot
+// CHECK: arith.cmpi sgt
 // CHECK-COUNT-6: linalg.matmul {{.*}}input_precision = "ieee"
 // CHECK: arith.addf
 // CHECK: return
