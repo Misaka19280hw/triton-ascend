@@ -5,14 +5,13 @@
 // CHECK-LABEL: func.func @bulk_plain
 // CHECK-SAME: %[[BASE:.*]]: memref<?xf8E4M3FN>, %[[STRIDE:.*]]: index
 // CHECK-DAG: %[[ORIGIN:.*]] = arith.constant 5 : index
-// CHECK-DAG: %[[TWO:.*]] = arith.constant 2 : index
-// CHECK-NOT: memref.alloc() : memref<128x64xf8E4M3FN>
-// CHECK: scf.for %[[TILE:[^ ]+]] =
-// CHECK: %[[DISP:.*]] = arith.muli %[[TILE]], %[[TWO]] : index
-// CHECK: %[[OFFSET:.*]] = arith.addi %[[DISP]], %[[ORIGIN]] : index
-// CHECK: memref.reinterpret_cast %[[BASE]] to offset: [%[[OFFSET]]], sizes: [128, 32], strides: [%[[STRIDE]], 2]
-// CHECK: memref.alloc() : memref<128x32xf8E4M3FN>
+// CHECK: memref.reinterpret_cast %[[BASE]] to offset: [%[[ORIGIN]]], sizes: [128, 64], strides: [%[[STRIDE]], 2]
+// CHECK: memref.alloc() : memref<128x64xf8E4M3FN>
 // CHECK: memref.copy
+// CHECK: %[[SNAPSHOT:.*]] = bufferization.to_tensor
+// CHECK: scf.for
+// CHECK: tensor.extract_slice %[[SNAPSHOT]]{{.*}} : tensor<128x64xf8E4M3FN> to tensor<128x32xf8E4M3FN>
+// CHECK-NOT: memref.alloc() : memref<128x32xf8E4M3FN>
 // CHECK: hfusion.matmul_mx
 // CHECK: tensor.insert_slice
 // CHECK: return {{.*}} : tensor<16x64xf32>
