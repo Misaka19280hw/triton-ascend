@@ -2667,17 +2667,20 @@ static Value decomposeF32Dot(triton::DotOp op, Value a, Value b, Value c,
     // Keep every batch's residual accumulation local to one 2D dot sequence.
     // This also avoids requiring a backend batch-matmul to carry nonzero
     // accumulators between several dependent partial products.
-    Value lower = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    // Dynamic CV loop pipelining expects an integer induction variable, like
+    // the scf.for loops emitted by the Triton frontend.
+    Value lower = rewriter.create<arith::ConstantIntOp>(loc, 0, 32);
     Value upper =
-        rewriter.create<arith::ConstantIndexOp>(loc, dstTy.getDimSize(0));
-    Value step = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+        rewriter.create<arith::ConstantIntOp>(loc, dstTy.getDimSize(0), 32);
+    Value step = rewriter.create<arith::ConstantIntOp>(loc, 1, 32);
     auto loop =
         rewriter.create<scf::ForOp>(loc, lower, upper, step, ValueRange{c});
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToStart(loop.getBody());
-    auto offsets = SmallVector<OpFoldResult>{loop.getInductionVar(),
-                                             rewriter.getIndexAttr(0),
-                                             rewriter.getIndexAttr(0)};
+    Value batchIndex = rewriter.create<arith::IndexCastOp>(
+        loc, rewriter.getIndexType(), loop.getInductionVar());
+    auto offsets = SmallVector<OpFoldResult>{
+        batchIndex, rewriter.getIndexAttr(0), rewriter.getIndexAttr(0)};
     auto strides = SmallVector<OpFoldResult>(3, rewriter.getIndexAttr(1));
     auto sizes = [&](Value value) {
       auto type = cast<RankedTensorType>(value.getType());
