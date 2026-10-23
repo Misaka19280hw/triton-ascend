@@ -1,5 +1,6 @@
 import pytest
 import torch
+import numpy as np
 
 import triton
 import triton.language as tl
@@ -88,3 +89,38 @@ def test_dot_compound_precision(precision, batched, nonzero_acc, data):
     actual = torch.empty(shape, dtype=torch.float32, device="npu")
     _compound_dot[(1, )](a.npu(), b.npu(), c.npu(), actual, precision, batched)
     torch.testing.assert_close(actual.cpu(), expected, rtol=2e-6, atol=2e-6, equal_nan=True)
+
+
+@triton.jit
+def _chained_compound_dot(A, B, W, D, PRECISION: tl.constexpr, SIZE: tl.constexpr):
+    r = tl.arange(0, SIZE)
+    offset = r[:, None] * SIZE + r[None, :]
+    a = tl.load(A + offset)
+    b = tl.load(B + offset)
+    w = tl.load(W + offset)
+    intermediate = tl.dot(a, b, input_precision=PRECISION)
+    result = tl.dot(intermediate, w, input_precision=PRECISION)
+    tl.store(D + offset, result)
+
+
+@pytest.mark.parametrize("precision", ["tf32x3", "bf16x3", "bf16x6"])
+@pytest.mark.parametrize("size", [16, 32, 64])
+def test_chained_compound_dot(precision, size):
+    generator = np.random.RandomState(17)
+    a, b, w = [torch.from_numpy(generator.randn(size, size).astype(np.float32)) for _ in range(3)]
+    a *= .1
+    b *= .1
+    zero = torch.zeros_like(a)
+    intermediate = _reference(a, b, zero, precision)
+    expected = _reference(intermediate, w, zero, precision)
+    actual = torch.empty_like(a, device="npu")
+    _chained_compound_dot[(1, )](a.npu(), b.npu(), w.npu(), actual, precision, size)
+    # Two K-term FP32 reductions may use different accumulation orders than
+    # the CPU oracle. Use the componentwise gamma_(2K) * |A| |B| |W| budget,
+    # gamma_n = n*u/(1-n*u), u = 2^-24, instead of a fixed absolute tolerance.
+    # Form the budget in FP64, including the scale for cancellation-heavy sums.
+    unit_roundoff = 2.**-24
+    gamma = (2 * size * unit_roundoff) / (1 - 2 * size * unit_roundoff)
+    scale = a.double().abs() @ b.double().abs() @ w.double().abs()
+    scaled_error = (actual.cpu().double() - expected.double()) / scale
+    torch.testing.assert_close(scaled_error, torch.zeros_like(scale), rtol=0, atol=gamma)

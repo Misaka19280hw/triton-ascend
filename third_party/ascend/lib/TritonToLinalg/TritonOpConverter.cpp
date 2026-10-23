@@ -2761,8 +2761,32 @@ static Value decomposeF32Dot(triton::DotOp op, Value a, Value b, Value c,
       SmallVector<Value> parts;
       auto valueTy = cast<RankedTensorType>(value.getType());
       auto partTy = valueTy.clone(rewriter.getBF16Type());
+      auto bitsTy = valueTy.clone(rewriter.getI32Type());
+      auto constant = [&](uint32_t bits) -> Value {
+        return rewriter.create<arith::ConstantOp>(
+            loc, DenseElementsAttr::get(bitsTy, APInt(32, bits)));
+      };
       for (unsigned i = 0; i < count; ++i) {
-        Value part = rewriter.create<arith::TruncFOp>(loc, partTy, value);
+        // Keep the source FP32 value live while forming its rounded BF16
+        // component. A matmul -> truncf fusion can otherwise round the source
+        // itself before the residual subtraction in a chained dot.
+        Value bits = rewriter.create<arith::BitcastOp>(loc, bitsTy, value);
+        Value high = rewriter.create<arith::ShRUIOp>(loc, bits, constant(16));
+        Value tie = rewriter.create<arith::AndIOp>(loc, high, constant(1));
+        Value bias = rewriter.create<arith::AddIOp>(loc, constant(0x7fff), tie);
+        Value rounded = rewriter.create<arith::AddIOp>(loc, bits, bias);
+        rounded = rewriter.create<arith::ShRUIOp>(loc, rounded, constant(16));
+        Value magnitude =
+            rewriter.create<arith::AndIOp>(loc, bits, constant(0x7fffffff));
+        Value isNaN = rewriter.create<arith::CmpIOp>(
+            loc, arith::CmpIPredicate::ugt, magnitude, constant(0x7f800000));
+        Value quietNaN =
+            rewriter.create<arith::OrIOp>(loc, high, constant(0x40));
+        rounded =
+            rewriter.create<arith::SelectOp>(loc, isNaN, quietNaN, rounded);
+        Value narrowBits = rewriter.create<arith::TruncIOp>(
+            loc, valueTy.clone(rewriter.getI16Type()), rounded);
+        Value part = rewriter.create<arith::BitcastOp>(loc, partTy, narrowBits);
         parts.push_back(part);
         if (i + 1 != count) {
           Value wide = rewriter.create<arith::ExtFOp>(loc, valueTy, part);
