@@ -3172,6 +3172,68 @@ matchScaledDotRowCopy(bufferization::ToTensorOp tensor) {
   return ScaledDotRowCopy{allocation, loop, copy, source, destination};
 }
 
+// HFusion accepts signed i32 indirect offsets. Recover that representation
+// only when the entire original i64 offset is a sign extension of i32; all
+// arithmetic (including i32 overflow), masks and read ordering stay unchanged.
+static void narrowNativeScaledDotOffsets(ArrayRef<Value> roots,
+                                         ConversionPatternRewriter &rewriter) {
+  llvm::SmallPtrSet<Operation *, 16> visited;
+  std::function<void(Value)> visit = [&](Value value) {
+    Operation *def = value ? value.getDefiningOp() : nullptr;
+    if (!def || !visited.insert(def).second)
+      return;
+    if (auto call = dyn_cast<func::CallOp>(def)) {
+      if (!call.getCallee().starts_with("triton_indirect_load") ||
+          call.getNumOperands() < 2 || call.getNumResults() != 1)
+        return;
+      auto function = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+          call, call.getCalleeAttr());
+      if (!function || !function.isPrivate() || !function.isExternal() ||
+          function.getFunctionType() !=
+              rewriter.getFunctionType(call.getOperandTypes(),
+                                       call.getResultTypes()))
+        return;
+      auto extend = call.getOperand(1).getDefiningOp<arith::ExtSIOp>();
+      if (!extend)
+        return;
+      auto inputType = dyn_cast<RankedTensorType>(extend.getIn().getType());
+      auto offsetType = dyn_cast<RankedTensorType>(extend.getType());
+      if (!inputType || !offsetType ||
+          !inputType.getElementType().isInteger(32) ||
+          !offsetType.getElementType().isInteger(64) ||
+          inputType.getShape() != offsetType.getShape())
+        return;
+      SmallVector<Value> operands(call.getOperands());
+      operands[1] = extend.getIn();
+      auto module = call->getParentOfType<ModuleOp>();
+      auto name = generateUniqueFuncName(module, "triton_indirect_load");
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToEnd(module.getBody());
+      auto narrowedFunction = rewriter.create<func::FuncOp>(
+          call.getLoc(), name.str(),
+          rewriter.getFunctionType(TypeRange(ValueRange(operands)),
+                                   call.getResultTypes()));
+      for (NamedAttribute attr : function->getAttrs())
+        if (attr.getName() != "sym_name" && attr.getName() != "function_type")
+          narrowedFunction->setAttr(attr.getName(), attr.getValue());
+      rewriter.setInsertionPoint(call);
+      auto narrowed = rewriter.create<func::CallOp>(
+          call.getLoc(), narrowedFunction.getSymNameAttr(),
+          call.getResultTypes(), operands);
+      for (NamedAttribute attr : call->getAttrs())
+        if (attr.getName() != "callee")
+          narrowed->setAttr(attr.getName(), attr.getValue());
+      rewriter.replaceOp(call, narrowed.getResults());
+      return;
+    }
+    if (isMemoryEffectFree(def))
+      for (Value operand : def->getOperands())
+        visit(operand);
+  };
+  for (Value root : roots)
+    visit(root);
+}
+
 // Tile only nonvolatile indirect reads whose original snapshot can be moved
 // to the dot. In particular, a store between the load and dot must not change
 // the value observed by the dot, even when the load has only one user.
@@ -3238,92 +3300,6 @@ public:
     };
     for (Value source : sources)
       visit(source, false);
-  }
-
-  // Bound address generation, not the native matrix product. Populate one
-  // private snapshot at the original read position using small indirect reads;
-  // the full MX operation and its accumulator keep their original layout.
-  Value materializeNativeOperand(Value source) {
-    Operation *def = source.getDefiningOp();
-    if (!def)
-      return source;
-    if (auto call = dyn_cast<func::CallOp>(def);
-        call && eligibleLoads.contains(call)) {
-      auto type = cast<RankedTensorType>(source.getType());
-      if (type.getRank() != 2 || !type.hasStaticShape() ||
-          type.getDimSize(0) <= 1 || type.getDimSize(0) % 2 != 0 ||
-          type.getDimSize(1) <= 0)
-        return source;
-      OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPoint(call);
-      auto loc = call.getLoc();
-      Value buffer = rewriter.create<memref::AllocOp>(
-          loc, MemRefType::get(type.getShape(), type.getElementType()));
-      Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-      // A one-row gather prevents the backend from assigning a legal
-      // minimum-sized subblock tile. Keep each read at least two rows,
-      // without changing the whole native product or forcing a partition.
-      Value rowStep = rewriter.create<arith::ConstantIndexOp>(loc, 2);
-      Value rows =
-          rewriter.create<arith::ConstantIndexOp>(loc, type.getDimSize(0));
-      Value cols =
-          rewriter.create<arith::ConstantIndexOp>(loc, type.getDimSize(1));
-      int64_t width = std::min<int64_t>(type.getDimSize(1), 256);
-      while (type.getDimSize(1) % width)
-        width /= 2;
-      Value step = rewriter.create<arith::ConstantIndexOp>(loc, width);
-      auto loop = rewriter.create<scf::ForOp>(
-          loc, zero, rows, rowStep, ValueRange{},
-          [&](OpBuilder &rowBuilder, Location, Value row, ValueRange) {
-            rowBuilder.create<scf::ForOp>(
-                loc, zero, cols, step, ValueRange{},
-                [&](OpBuilder &builder, Location, Value col, ValueRange) {
-                  SmallVector<OpFoldResult> offsets{row, col};
-                  SmallVector<OpFoldResult> sizes{builder.getIndexAttr(2),
-                                                  builder.getIndexAttr(width)};
-                  SmallVector<OpFoldResult> strides(2, builder.getIndexAttr(1));
-                  // Reuse the original integer address DAG, mask and other.
-                  // In particular, retain i32 arithmetic before index casts.
-                  Value value = slice(builder, source, offsets, sizes);
-                  Value destination = builder.create<memref::SubViewOp>(
-                      loc, buffer, offsets, sizes, strides);
-                  auto write =
-                      builder.create<bufferization::MaterializeInDestinationOp>(
-                          loc, value, destination);
-                  write.setWritable(true);
-                  builder.create<scf::YieldOp>(loc);
-                });
-            rowBuilder.create<scf::YieldOp>(loc);
-          });
-      // Populate the snapshot without assigning its contraction rows to
-      // vector subblocks. Native MX retains ownership of the complete layout.
-      loop->setAttr("ExtractedLoadOrStore", rewriter.getUnitAttr());
-      return rewriter.create<bufferization::ToTensorOp>(
-          loc, type, buffer, /*restrict=*/true, /*writable=*/true);
-    }
-    bool supported =
-        def->getNumResults() == 1 && isMemoryEffectFree(def) &&
-        ((def->getNumRegions() == 0 &&
-          (def->hasTrait<OpTrait::Elementwise>() ||
-           isa<triton::BroadcastOp, triton::ExpandDimsOp>(def))) ||
-         (isa<linalg::TransposeOp>(def) &&
-          cast<linalg::TransposeOp>(def).hasPureTensorSemantics()));
-    if (!supported)
-      return source;
-    IRMapping mapping;
-    bool changed = false;
-    for (Value operand : def->getOperands()) {
-      if (!isa<RankedTensorType>(operand.getType()))
-        continue;
-      Value replacement = materializeNativeOperand(operand);
-      if (replacement != operand) {
-        mapping.map(operand, replacement);
-        changed = true;
-      }
-    }
-    if (!changed)
-      return source;
-    return rewriter.clone(*def, mapping)->getResult(0);
   }
 
   Value slice(OpBuilder &builder, Value source, ArrayRef<OpFoldResult> offsets,
@@ -3827,36 +3803,35 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
                      dstType.getElementType().isF32() && op.getLhsKPack() &&
                      op.getRhsKPack() && hasE8M0Scale(lhsScale) &&
                      hasE8M0Scale(rhsScale);
-  // Native MX keeps its complete K reduction while bounding the M/N
-  // slices and their address tensors. Software fallback also bounds K
-  // before decoding inputs to f32. Both carry the original accumulator.
+  // Native MX retains its complete product and accumulator. Its indirect
+  // reads may use their exact signed i32 offsets without materializing i64.
+  if (useNativeMx) {
+    narrowNativeScaledDotOffsets({lhs, rhs}, rewriter);
+    lhs = rewriter.getRemappedValue(lhs);
+    rhs = rewriter.getRemappedValue(rhs);
+  }
+  // Bound M, N and K before the software path decodes inputs to f32.
   auto lhsTy = cast<RankedTensorType>(lhs.getType());
   int64_t logicalK = lhsTy.getShape().back();
   if (lhsElemType == triton::ScaleDotElemType::E2M1 && op.getLhsKPack())
     logicalK *= 2;
   constexpr int64_t fallbackTile = 32;
-  constexpr int64_t nativeTile = 32;
-  int64_t tileLimit = useNativeMx ? nativeTile : fallbackTile;
+  constexpr int64_t tileLimit = fallbackTile;
   auto tileSize = [&](int64_t dim) {
     int64_t size = std::min(dim, tileLimit);
     while (dim % size)
       size /= 2;
     return size;
   };
-  ScaledDotLoadTiler loadTiler(op, rewriter, /*tileBulkLoads=*/useNativeMx);
-  loadTiler.prepare({op.getA(), op.getB(), op.getAScale(), op.getBScale()},
-                    {lhs, rhs, lhsScale, rhsScale});
-  if (useNativeMx) {
-    lhs = loadTiler.materializeNativeOperand(lhs);
-    rhs = loadTiler.materializeNativeOperand(rhs);
-    loadTiler.markOriginalLoads();
-  }
   if (!useNativeMx && dstType.getRank() == 2 &&
       (dstType.getDimSize(0) > tileLimit || dstType.getDimSize(1) > tileLimit ||
        logicalK > fallbackTile)) {
     int64_t tileM = tileSize(dstType.getDimSize(0));
     int64_t tileN = tileSize(dstType.getDimSize(1));
-    int64_t tileK = useNativeMx ? logicalK : tileSize(logicalK);
+    ScaledDotLoadTiler loadTiler(op, rewriter, /*tileBulkLoads=*/false);
+    loadTiler.prepare({op.getA(), op.getB(), op.getAScale(), op.getBScale()},
+                      {lhs, rhs, lhsScale, rhsScale});
+    int64_t tileK = tileSize(logicalK);
     auto f32Type = dstType.clone(rewriter.getF32Type());
     if (c.getType() != f32Type)
       c = rewriter.create<arith::ExtFOp>(loc, f32Type, c);
@@ -3876,9 +3851,6 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
       Value factor = builder.create<arith::ConstantIndexOp>(loc, divisor);
       return builder.create<arith::DivUIOp>(loc, index, factor);
     };
-    // Bulk-copy and transpose sinking bounds native MX input storage. Keep
-    // the software path's established load layout: its vector subblock
-    // partitioning is independent of native MX tile assembly.
     auto slice = [&](OpBuilder &builder, Value source, Value row, Value col,
                      int64_t rows, int64_t cols) -> Value {
       SmallVector<OpFoldResult> offsets{row, col};
@@ -3909,21 +3881,13 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
       return slice(builder, scale, nonK, divideIndex(builder, k, groupSize),
                    nonKSize, tileK / groupSize);
     };
-    // Each native M/N tile is written exactly once. Keep its original
-    // accumulator separate from the destination so bufferization need not
-    // preserve and copy a full output tensor between tile updates.
-    Value output = c;
-    if (useNativeMx)
-      output = rewriter.create<tensor::EmptyOp>(loc, f32Type.getShape(),
-                                                f32Type.getElementType());
     auto mLoop = rewriter.create<scf::ForOp>(
-        loc, zero, mEnd, mStep, ValueRange{output},
+        loc, zero, mEnd, mStep, ValueRange{c},
         [&](OpBuilder &mBuilder, Location, Value m, ValueRange mAcc) {
           auto nLoop = mBuilder.create<scf::ForOp>(
               loc, zero, nEnd, nStep, mAcc,
               [&](OpBuilder &nBuilder, Location, Value n, ValueRange nAcc) {
-                Value tileAcc = slice(nBuilder, useNativeMx ? c : nAcc[0], m, n,
-                                      tileM, tileN);
+                Value tileAcc = slice(nBuilder, nAcc[0], m, n, tileM, tileN);
                 auto kLoop = nBuilder.create<scf::ForOp>(
                     loc, zero, kEnd, kStep, ValueRange{tileAcc},
                     [&](OpBuilder &builder, Location, Value k,
