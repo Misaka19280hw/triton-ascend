@@ -3291,10 +3291,9 @@ public:
                 });
             rowBuilder.create<scf::YieldOp>(loc);
           });
-      // These iterations write disjoint rows of a fresh allocation, matching
-      // the existing bufferized discrete-load loops.
+      // Populate the snapshot without assigning its contraction rows to
+      // vector subblocks. Native MX retains ownership of the complete layout.
       loop->setAttr("ExtractedLoadOrStore", rewriter.getUnitAttr());
-      loop->setAttr("hivm.parallel_loop", rewriter.getUnitAttr());
       return rewriter.create<bufferization::ToTensorOp>(
           loc, type, buffer, /*restrict=*/true, /*writable=*/true);
     }
