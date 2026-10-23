@@ -3240,57 +3240,87 @@ public:
       visit(source, false);
   }
 
-  // Native MX already tiles ordinary operands internally. Introduce an outer
-  // M/N loop only when slicing an operand actually reduces an indirect load's
-  // address tensor. Follow the same supported paths as slice(), including its
-  // transpose ownership proof; merely finding a load below an opaque op is not
-  // sufficient. Ineligible snapshots and scale-only loads do not require a
-  // new full-result assembly buffer.
-  bool shrinksIndirectLoad(Value source, ArrayRef<int64_t> shape) const {
-    auto type = dyn_cast<RankedTensorType>(source.getType());
+  // Bound address generation, not the native matrix product. Populate one
+  // private snapshot at the original read position using small indirect reads;
+  // the full MX operation and its accumulator keep their original layout.
+  Value materializeNativeOperand(Value source) {
     Operation *def = source.getDefiningOp();
-    if (!type || !def || shape.size() != type.getRank())
-      return false;
-    if (auto call = dyn_cast<func::CallOp>(def))
-      return eligibleLoads.contains(call) &&
-             llvm::any_of(llvm::zip(shape, type.getShape()), [](auto dims) {
-               return std::get<0>(dims) < std::get<1>(dims);
-             });
-    if (auto transpose = dyn_cast<linalg::TransposeOp>(def)) {
-      if (!tileBulkLoads || !transpose.hasPureTensorSemantics() ||
-          !canTileTransposeInput(transpose.getInput()))
-        return false;
-      SmallVector<int64_t> inputShape(shape.size());
-      for (auto [dim, inputDim] : llvm::enumerate(transpose.getPermutation()))
-        inputShape[inputDim] = shape[dim];
-      return shrinksIndirectLoad(transpose.getInput(), inputShape);
+    if (!def)
+      return source;
+    if (auto call = dyn_cast<func::CallOp>(def);
+        call && eligibleLoads.contains(call)) {
+      auto type = cast<RankedTensorType>(source.getType());
+      if (type.getRank() != 2 || !type.hasStaticShape() ||
+          type.getDimSize(0) <= 1 || type.getDimSize(1) <= 0)
+        return source;
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPoint(call);
+      auto loc = call.getLoc();
+      Value buffer = rewriter.create<memref::AllocOp>(
+          loc, MemRefType::get(type.getShape(), type.getElementType()));
+      Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+      Value rows =
+          rewriter.create<arith::ConstantIndexOp>(loc, type.getDimSize(0));
+      Value cols =
+          rewriter.create<arith::ConstantIndexOp>(loc, type.getDimSize(1));
+      int64_t width = std::min<int64_t>(type.getDimSize(1), 256);
+      while (type.getDimSize(1) % width)
+        width /= 2;
+      Value step = rewriter.create<arith::ConstantIndexOp>(loc, width);
+      auto loop = rewriter.create<scf::ForOp>(
+          loc, zero, rows, one, ValueRange{},
+          [&](OpBuilder &rowBuilder, Location, Value row, ValueRange) {
+            rowBuilder.create<scf::ForOp>(
+                loc, zero, cols, step, ValueRange{},
+                [&](OpBuilder &builder, Location, Value col, ValueRange) {
+                  SmallVector<OpFoldResult> offsets{row, col};
+                  SmallVector<OpFoldResult> sizes{builder.getIndexAttr(1),
+                                                  builder.getIndexAttr(width)};
+                  SmallVector<OpFoldResult> strides(2, builder.getIndexAttr(1));
+                  // Reuse the original integer address DAG, mask and other.
+                  // In particular, retain i32 arithmetic before index casts.
+                  Value value = slice(builder, source, offsets, sizes);
+                  Value destination = builder.create<memref::SubViewOp>(
+                      loc, buffer, offsets, sizes, strides);
+                  auto write =
+                      builder.create<bufferization::MaterializeInDestinationOp>(
+                          loc, value, destination);
+                  write.setWritable(true);
+                  builder.create<scf::YieldOp>(loc);
+                });
+            rowBuilder.create<scf::YieldOp>(loc);
+          });
+      // These iterations write disjoint rows of a fresh allocation, matching
+      // the existing bufferized discrete-load loops.
+      loop->setAttr("ExtractedLoadOrStore", rewriter.getUnitAttr());
+      loop->setAttr("hivm.parallel_loop", rewriter.getUnitAttr());
+      return rewriter.create<bufferization::ToTensorOp>(
+          loc, type, buffer, /*restrict=*/true, /*writable=*/true);
     }
-    if (auto broadcast = dyn_cast<triton::BroadcastOp>(def)) {
-      auto inputType = cast<RankedTensorType>(broadcast.getSrc().getType());
-      SmallVector<int64_t> inputShape(shape);
-      for (int64_t dim = 0; dim < type.getRank(); ++dim)
-        if (inputType.getDimSize(dim) == 1)
-          inputShape[dim] = 1;
-      return shrinksIndirectLoad(broadcast.getSrc(), inputShape);
-    }
-    if (auto expand = dyn_cast<triton::ExpandDimsOp>(def)) {
-      SmallVector<int64_t> inputShape(shape);
-      inputShape.erase(inputShape.begin() + expand.getAxis());
-      return shrinksIndirectLoad(expand.getSrc(), inputShape);
-    }
-    if (def->getNumResults() != 1 || def->getNumRegions() != 0 ||
-        !def->hasTrait<OpTrait::Elementwise>() || !isMemoryEffectFree(def))
-      return false;
-    bool shrinks = false;
+    bool supported =
+        def->getNumResults() == 1 && isMemoryEffectFree(def) &&
+        ((def->getNumRegions() == 0 &&
+          (def->hasTrait<OpTrait::Elementwise>() ||
+           isa<triton::BroadcastOp, triton::ExpandDimsOp>(def))) ||
+         (isa<linalg::TransposeOp>(def) &&
+          cast<linalg::TransposeOp>(def).hasPureTensorSemantics()));
+    if (!supported)
+      return source;
+    IRMapping mapping;
+    bool changed = false;
     for (Value operand : def->getOperands()) {
-      auto operandType = dyn_cast<RankedTensorType>(operand.getType());
-      if (!operandType)
+      if (!isa<RankedTensorType>(operand.getType()))
         continue;
-      if (operandType.getShape() != type.getShape())
-        return false;
-      shrinks |= shrinksIndirectLoad(operand, shape);
+      Value replacement = materializeNativeOperand(operand);
+      if (replacement != operand) {
+        mapping.map(operand, replacement);
+        changed = true;
+      }
     }
-    return shrinks;
+    if (!changed)
+      return source;
+    return rewriter.clone(*def, mapping)->getResult(0);
   }
 
   Value slice(OpBuilder &builder, Value source, ArrayRef<OpFoldResult> offsets,
@@ -3813,17 +3843,14 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
   ScaledDotLoadTiler loadTiler(op, rewriter, /*tileBulkLoads=*/useNativeMx);
   loadTiler.prepare({op.getA(), op.getB(), op.getAScale(), op.getBScale()},
                     {lhs, rhs, lhsScale, rhsScale});
-  auto rhsTy = cast<RankedTensorType>(rhs.getType());
-  bool tileNative =
-      useNativeMx && dstType.hasStaticShape() && dstType.getDimSize(0) > 0 &&
-      dstType.getDimSize(1) > 0 &&
-      (loadTiler.shrinksIndirectLoad(
-           lhs, {tileSize(dstType.getDimSize(0)), lhsTy.getDimSize(1)}) ||
-       loadTiler.shrinksIndirectLoad(
-           rhs, {rhsTy.getDimSize(0), tileSize(dstType.getDimSize(1))}));
-  if ((!useNativeMx || tileNative) && dstType.getRank() == 2 &&
+  if (useNativeMx) {
+    lhs = loadTiler.materializeNativeOperand(lhs);
+    rhs = loadTiler.materializeNativeOperand(rhs);
+    loadTiler.markOriginalLoads();
+  }
+  if (!useNativeMx && dstType.getRank() == 2 &&
       (dstType.getDimSize(0) > tileLimit || dstType.getDimSize(1) > tileLimit ||
-       (!useNativeMx && logicalK > fallbackTile))) {
+       logicalK > fallbackTile)) {
     int64_t tileM = tileSize(dstType.getDimSize(0));
     int64_t tileN = tileSize(dstType.getDimSize(1));
     int64_t tileK = useNativeMx ? logicalK : tileSize(logicalK);
