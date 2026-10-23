@@ -3066,42 +3066,6 @@ static bool isNonvolatileScaledDotCopy(memref::CopyOp copy) {
   return volatility && !volatility.getValue();
 }
 
-// A full unmasked load can also lower to one strided memref.copy. Its private
-// destination must not escape: replacing the read with tile reads must remove
-// the original snapshot, rather than leave both full and tiled buffers live.
-static memref::CopyOp matchScaledDotBulkCopy(bufferization::ToTensorOp tensor) {
-  auto allocation = tensor.getBuffer().getDefiningOp<memref::AllocOp>();
-  if (!allocation || allocation->getBlock() != tensor->getBlock() ||
-      allocation.getType().getRank() != 2 ||
-      !allocation.getType().hasStaticShape() ||
-      !allocation.getType().getLayout().isIdentity() ||
-      allocation.getType().getMemorySpace())
-    return nullptr;
-  memref::CopyOp copy;
-  for (Operation *user : allocation->getUsers()) {
-    if (user == tensor)
-      continue;
-    if (copy || !(copy = dyn_cast<memref::CopyOp>(user)) ||
-        copy.getTarget() != allocation.getResult())
-      return nullptr;
-  }
-  if (!copy || !isNonvolatileScaledDotCopy(copy) ||
-      copy->getBlock() != tensor->getBlock() ||
-      !allocation->isBeforeInBlock(copy) || !copy->isBeforeInBlock(tensor))
-    return nullptr;
-  auto sourceType = dyn_cast<MemRefType>(copy.getSource().getType());
-  auto source = copy.getSource().getDefiningOp<memref::ReinterpretCastOp>();
-  if (!sourceType || sourceType.getShape() != allocation.getType().getShape() ||
-      sourceType.getElementType() != allocation.getType().getElementType() ||
-      !source || source.getMixedOffsets().size() != 1)
-    return nullptr;
-  SmallVector<int64_t> strides;
-  int64_t offset;
-  if (failed(sourceType.getStridesAndOffset(strides, offset)))
-    return nullptr;
-  return copy;
-}
-
 struct ScaledDotRowCopy {
   memref::AllocOp allocation;
   scf::ForOp loop;
@@ -3240,53 +3204,20 @@ static void narrowNativeScaledDotOffsets(ArrayRef<Value> roots,
 class ScaledDotLoadTiler {
 public:
   ScaledDotLoadTiler(triton::DotScaledOp dot,
-                     ConversionPatternRewriter &rewriter, bool tileBulkLoads)
-      : dot(dot), rewriter(rewriter), tileBulkLoads(tileBulkLoads) {}
+                     ConversionPatternRewriter &rewriter)
+      : dot(dot), rewriter(rewriter) {}
 
-  void prepare(ArrayRef<Value> originals, ArrayRef<Value> sources) {
-    // Dialect conversion defers erasing the old transpose and redirecting
-    // the old dot's operand. Account for that exact replacement only: its
-    // new result has a pending dot use, and the old/new transpose pair has
-    // one logical read of the input. Real shared users still count.
-    for (auto [original, source] : llvm::zip(originals, sources)) {
-      if (!tileBulkLoads || !original || !source || original == source ||
-          !original.hasOneUse() ||
-          *original.getUsers().begin() != dot.getOperation())
-        continue;
-      auto oldTranspose = original.getDefiningOp<triton::TransOp>();
-      auto newTranspose = source.getDefiningOp<linalg::TransposeOp>();
-      if (!oldTranspose || !newTranspose || !isMemoryEffectFree(oldTranspose) ||
-          !newTranspose.hasPureTensorSemantics() ||
-          oldTranspose.getSrc() != newTranspose.getInput() ||
-          rewriter.getRemappedValue(original) != source ||
-          !llvm::equal(oldTranspose.getOrder(), newTranspose.getPermutation()))
-        continue;
-      pendingDotUses.push_back(source);
-      replacedTransposes.insert(oldTranspose);
-    }
+  void prepare(ArrayRef<Value> sources) {
     llvm::SmallPtrSet<Operation *, 16> visited;
-    std::function<void(Value, bool)> visit = [&](Value value,
-                                                 bool throughTranspose) {
+    std::function<void(Value)> visit = [&](Value value) {
       Operation *def = value ? value.getDefiningOp() : nullptr;
-      if (!def || !hasOneLogicalUse(value) || !visited.insert(def).second)
+      if (!def || !value.hasOneUse() || !visited.insert(def).second)
         return;
       if (auto tensor = dyn_cast<bufferization::ToTensorOp>(def)) {
         auto rowCopy = matchScaledDotRowCopy(tensor);
         if (rowCopy && tensor->getBlock() == dot->getBlock() &&
             canCrossToDot(rowCopy->loop))
           eligibleCopies.insert(tensor);
-        // Keep untransposed operands' original snapshots. Their vector
-        // subblock partition follows the full result's M coordinate; direct
-        // CUBE loads of rebased M tiles do not preserve that partition during
-        // output assembly. Transpose paths need tiled reads to avoid both a
-        // full snapshot and its transposed buffer, and retain their existing
-        // slice/transpose ownership proof below.
-        if (tileBulkLoads && throughTranspose) {
-          auto bulkCopy = matchScaledDotBulkCopy(tensor);
-          if (bulkCopy && tensor->getBlock() == dot->getBlock() &&
-              canCrossToDot(bulkCopy))
-            eligibleBulkCopies.insert(tensor);
-        }
         return;
       }
       if (auto call = dyn_cast<func::CallOp>(def)) {
@@ -3296,10 +3227,10 @@ public:
       }
       if (isMemoryEffectFree(def))
         for (Value operand : def->getOperands())
-          visit(operand, throughTranspose || isa<linalg::TransposeOp>(def));
+          visit(operand);
     };
     for (Value source : sources)
-      visit(source, false);
+      visit(source);
   }
 
   Value slice(OpBuilder &builder, Value source, ArrayRef<OpFoldResult> offsets,
@@ -3310,37 +3241,6 @@ public:
       shape.push_back(cast<IntegerAttr>(cast<Attribute>(size)).getInt());
     auto resultType = type.clone(shape);
     Operation *def = source.getDefiningOp();
-    if (auto tensor = dyn_cast_or_null<bufferization::ToTensorOp>(def);
-        tensor && eligibleBulkCopies.contains(tensor)) {
-      auto copy = matchScaledDotBulkCopy(tensor);
-      auto loc = tensor.getLoc();
-      auto source = copy.getSource().getDefiningOp<memref::ReinterpretCastOp>();
-      auto strides = source.getMixedStrides();
-      Value offset = getValueOrCreateConstantIndexOp(
-          builder, loc, source.getMixedOffsets().front());
-      for (auto [tileOffset, stride] : llvm::zip(offsets, strides)) {
-        Value index = getValueOrCreateConstantIndexOp(builder, loc, tileOffset);
-        Value step = getValueOrCreateConstantIndexOp(builder, loc, stride);
-        Value displacement = builder.create<arith::MulIOp>(loc, index, step);
-        offset = builder.create<arith::AddIOp>(loc, offset, displacement);
-      }
-      // Start tile coordinates at zero. The backend's subblock partitioning
-      // must not intersect tile-relative rows with a nonzero subview origin.
-      // Keep the original base offset and both strides in the address itself.
-      auto viewType = MemRefType::get(
-          shape, type.getElementType(),
-          StridedLayoutAttr::get(builder.getContext(), ShapedType::kDynamic,
-                                 source.getStaticStrides()),
-          source.getType().getMemorySpace());
-      Value input = builder.create<memref::ReinterpretCastOp>(
-          loc, viewType, source.getSource(), offset, sizes, strides);
-      Value tile = builder.create<memref::AllocOp>(
-          loc, MemRefType::get(shape, type.getElementType()));
-      builder.create<memref::CopyOp>(loc, input, tile);
-      replacedBulkCopies.insert(tensor);
-      return builder.create<bufferization::ToTensorOp>(
-          loc, resultType, tile, /*restrict=*/true, /*writable=*/true);
-    }
     if (auto tensor = dyn_cast_or_null<bufferization::ToTensorOp>(def);
         tensor && eligibleCopies.contains(tensor)) {
       auto rowCopy = *matchScaledDotRowCopy(tensor);
@@ -3423,25 +3323,6 @@ public:
       replacedLoads.insert(call);
       return tiled.getResult(0);
     }
-    if (auto transpose = dyn_cast_or_null<linalg::TransposeOp>(def);
-        tileBulkLoads && transpose && transpose.hasPureTensorSemantics() &&
-        canTileTransposeInput(transpose.getInput())) {
-      ArrayRef<int64_t> permutation = transpose.getPermutation();
-      SmallVector<OpFoldResult> inputOffsets(offsets.size());
-      SmallVector<OpFoldResult> inputSizes(sizes.size());
-      for (auto [dim, inputDim] : llvm::enumerate(permutation)) {
-        inputOffsets[inputDim] = offsets[dim];
-        inputSizes[inputDim] = sizes[dim];
-      }
-      Value input =
-          slice(builder, transpose.getInput(), inputOffsets, inputSizes);
-      Value output = builder.create<tensor::EmptyOp>(def->getLoc(), shape,
-                                                     type.getElementType());
-      return builder
-          .create<linalg::TransposeOp>(def->getLoc(), input, output,
-                                       permutation)
-          ->getResult(0);
-    }
     if (def && def->getNumResults() == 1 && def->getNumRegions() == 0 &&
         def->hasTrait<OpTrait::Elementwise>() && isMemoryEffectFree(def)) {
       IRMapping mapping;
@@ -3495,54 +3376,9 @@ public:
           matchScaledDotRowCopy(cast<bufferization::ToTensorOp>(tensor));
       rowCopy->loop->setAttr("tt.scaled_dot_tiled", rewriter.getUnitAttr());
     }
-    for (Operation *tensor : replacedBulkCopies)
-      matchScaledDotBulkCopy(cast<bufferization::ToTensorOp>(tensor))
-          ->setAttr("tt.scaled_dot_tiled", rewriter.getUnitAttr());
   }
 
 private:
-  bool hasOneLogicalUse(Value value) const {
-    unsigned uses = llvm::count(pendingDotUses, value);
-    for (Operation *user : value.getUsers())
-      if (!replacedTransposes.contains(user))
-        ++uses;
-    return uses == 1;
-  }
-
-  // Push a transpose through a slice only when every tensor input can be
-  // reconstructed from a tiled load or a uniform value. Slicing an already
-  // materialized snapshot before transposing does not save its storage and
-  // changes the backend's subblock layout of that snapshot.
-  bool canTileTransposeInput(Value source) const {
-    Operation *def = source.getDefiningOp();
-    if (!def)
-      return false;
-    if (auto tensor = dyn_cast<bufferization::ToTensorOp>(def))
-      return eligibleCopies.contains(tensor) ||
-             eligibleBulkCopies.contains(tensor);
-    if (auto call = dyn_cast<func::CallOp>(def))
-      return eligibleLoads.contains(call);
-    if (isa<triton::SplatOp>(def))
-      return true;
-    if (auto constant = dyn_cast<arith::ConstantOp>(def)) {
-      auto value = dyn_cast<DenseElementsAttr>(constant.getValue());
-      return value && value.isSplat();
-    }
-    if (auto broadcast = dyn_cast<triton::BroadcastOp>(def))
-      return canTileTransposeInput(broadcast.getSrc());
-    if (auto expand = dyn_cast<triton::ExpandDimsOp>(def))
-      return canTileTransposeInput(expand.getSrc());
-    if (def->getNumResults() != 1 || def->getNumRegions() != 0 ||
-        !def->hasTrait<OpTrait::Elementwise>() || !isMemoryEffectFree(def))
-      return false;
-    auto type = cast<RankedTensorType>(source.getType());
-    return llvm::all_of(def->getOperands(), [&](Value operand) {
-      auto operandType = dyn_cast<RankedTensorType>(operand.getType());
-      return !operandType || (operandType.getShape() == type.getShape() &&
-                              canTileTransposeInput(operand));
-    });
-  }
-
   static bool isNonvolatileIndirectLoad(func::CallOp call) {
     auto volatility = call->getAttrOfType<BoolAttr>("isVolatile");
     return call.getCallee().starts_with("triton_indirect_load") && volatility &&
@@ -3599,8 +3435,8 @@ private:
 
   bool canTileLoad(func::CallOp call) const {
     if (!isNonvolatileIndirectLoad(call) || call.getNumResults() != 1 ||
-        !hasOneLogicalUse(call.getResult(0)) ||
-        call->getBlock() != dot->getBlock() || call.getNumOperands() < 2 ||
+        !call.getResult(0).hasOneUse() || call->getBlock() != dot->getBlock() ||
+        call.getNumOperands() < 2 ||
         !isa<MemRefType>(call.getOperand(0).getType()))
       return false;
     auto resultType = dyn_cast<RankedTensorType>(call.getResult(0).getType());
@@ -3633,15 +3469,10 @@ private:
 
   triton::DotScaledOp dot;
   ConversionPatternRewriter &rewriter;
-  bool tileBulkLoads;
-  SmallVector<Value, 4> pendingDotUses;
-  llvm::SmallPtrSet<Operation *, 4> replacedTransposes;
   llvm::SmallPtrSet<Operation *, 2> eligibleLoads;
   llvm::SmallPtrSet<Operation *, 2> replacedLoads;
   llvm::SmallPtrSet<Operation *, 2> eligibleCopies;
   llvm::SmallPtrSet<Operation *, 2> replacedCopies;
-  llvm::SmallPtrSet<Operation *, 2> eligibleBulkCopies;
-  llvm::SmallPtrSet<Operation *, 2> replacedBulkCopies;
 };
 
 struct EraseTiledScaledDotLoad : OpRewritePattern<func::CallOp> {
@@ -3688,36 +3519,11 @@ struct EraseTiledScaledDotCopy : OpRewritePattern<scf::ForOp> {
     return success();
   }
 };
-struct EraseTiledScaledDotBulkCopy : OpRewritePattern<memref::CopyOp> {
-  using OpRewritePattern::OpRewritePattern;
-  LogicalResult matchAndRewrite(memref::CopyOp copy,
-                                PatternRewriter &rewriter) const override {
-    if (!copy->hasAttr("tt.scaled_dot_tiled"))
-      return failure();
-    auto allocation = copy.getTarget().getDefiningOp<memref::AllocOp>();
-    if (!allocation)
-      return failure();
-    SmallVector<Operation *> deadTensors;
-    for (Operation *user : allocation->getUsers()) {
-      if (user == copy)
-        continue;
-      if (!isa<bufferization::ToTensorOp>(user) || !user->use_empty())
-        return failure();
-      deadTensors.push_back(user);
-    }
-    for (Operation *tensor : deadTensors)
-      rewriter.eraseOp(tensor);
-    rewriter.eraseOp(copy);
-    if (allocation->use_empty())
-      rewriter.eraseOp(allocation);
-    return success();
-  }
-};
 } // namespace
 
 void populateScaledDotCanonicalizationPatterns(RewritePatternSet &patterns) {
-  patterns.add<EraseTiledScaledDotLoad, EraseTiledScaledDotCopy,
-               EraseTiledScaledDotBulkCopy>(patterns.getContext());
+  patterns.add<EraseTiledScaledDotLoad, EraseTiledScaledDotCopy>(
+      patterns.getContext());
 }
 
 LogicalResult
@@ -3828,9 +3634,8 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
        logicalK > fallbackTile)) {
     int64_t tileM = tileSize(dstType.getDimSize(0));
     int64_t tileN = tileSize(dstType.getDimSize(1));
-    ScaledDotLoadTiler loadTiler(op, rewriter, /*tileBulkLoads=*/false);
-    loadTiler.prepare({op.getA(), op.getB(), op.getAScale(), op.getBScale()},
-                      {lhs, rhs, lhsScale, rhsScale});
+    ScaledDotLoadTiler loadTiler(op, rewriter);
+    loadTiler.prepare({lhs, rhs, lhsScale, rhsScale});
     int64_t tileK = tileSize(logicalK);
     auto f32Type = dstType.clone(rewriter.getF32Type());
     if (c.getType() != f32Type)
