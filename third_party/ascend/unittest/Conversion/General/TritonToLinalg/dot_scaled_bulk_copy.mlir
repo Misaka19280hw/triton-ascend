@@ -162,7 +162,9 @@ func.func @bulk_transpose(%base: memref<?xf8E4M3FN>, %row_stride: index, %a: ten
 // CHECK-LABEL: func.func @bulk_transpose_alias
 // CHECK: memref.alloc() : memref<64x128xf8E4M3FN>
 // CHECK: memref.copy
-// CHECK: tensor.extract_slice {{.*}} : tensor<64x128xf8E4M3FN> to tensor<32x128xf8E4M3FN>
+// CHECK: %[[SNAPSHOT:.*]] = linalg.transpose ins({{.*}} : tensor<64x128xf8E4M3FN>)
+// CHECK: scf.for
+// CHECK: tensor.extract_slice %[[SNAPSHOT]]{{.*}} : tensor<128x64xf8E4M3FN> to tensor<128x32xf8E4M3FN>
 // CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
 func.func @bulk_transpose_alias(%base: memref<?xf8E4M3FN>, %row_stride: index, %a: tensor<16x128xf8E4M3FN>, %c: tensor<16x64xf32>) -> tensor<16x64xf32> {
   %base_offset = arith.constant 5 : index
@@ -184,7 +186,9 @@ func.func @bulk_transpose_alias(%base: memref<?xf8E4M3FN>, %row_stride: index, %
 // CHECK-LABEL: func.func @bulk_transpose_shared
 // CHECK: memref.alloc() : memref<64x128xf8E4M3FN>
 // CHECK: memref.copy
-// CHECK: tensor.extract_slice {{.*}} : tensor<64x128xf8E4M3FN> to tensor<32x128xf8E4M3FN>
+// CHECK: %[[SNAPSHOT:.*]] = linalg.transpose ins({{.*}} : tensor<64x128xf8E4M3FN>)
+// CHECK: scf.for
+// CHECK: tensor.extract_slice %[[SNAPSHOT]]{{.*}} : tensor<128x64xf8E4M3FN> to tensor<128x32xf8E4M3FN>
 // CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
 func.func @bulk_transpose_shared(%base: memref<?xf8E4M3FN>, %row_stride: index, %a: tensor<16x128xf8E4M3FN>, %c: tensor<16x64xf32>) -> (tensor<16x64xf32>, f8E4M3FN) {
   %base_offset = arith.constant 5 : index
