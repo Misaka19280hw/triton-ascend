@@ -3181,11 +3181,31 @@ public:
                      ConversionPatternRewriter &rewriter, bool tileBulkLoads)
       : dot(dot), rewriter(rewriter), tileBulkLoads(tileBulkLoads) {}
 
-  void prepare(ArrayRef<Value> sources) {
+  void prepare(ArrayRef<Value> originals, ArrayRef<Value> sources) {
+    // Dialect conversion defers erasing the old transpose and redirecting
+    // the old dot's operand. Account for that exact replacement only: its
+    // new result has a pending dot use, and the old/new transpose pair has
+    // one logical read of the input. Real shared users still count.
+    for (auto [original, source] : llvm::zip(originals, sources)) {
+      if (!tileBulkLoads || !original || !source || original == source ||
+          !original.hasOneUse() ||
+          *original.getUsers().begin() != dot.getOperation())
+        continue;
+      auto oldTranspose = original.getDefiningOp<triton::TransOp>();
+      auto newTranspose = source.getDefiningOp<linalg::TransposeOp>();
+      if (!oldTranspose || !newTranspose || !isMemoryEffectFree(oldTranspose) ||
+          !newTranspose.hasPureTensorSemantics() ||
+          oldTranspose.getSrc() != newTranspose.getInput() ||
+          rewriter.getRemappedValue(original) != source ||
+          !llvm::equal(oldTranspose.getOrder(), newTranspose.getPermutation()))
+        continue;
+      pendingDotUses.push_back(source);
+      replacedTransposes.insert(oldTranspose);
+    }
     llvm::SmallPtrSet<Operation *, 16> visited;
     std::function<void(Value)> visit = [&](Value value) {
       Operation *def = value ? value.getDefiningOp() : nullptr;
-      if (!def || !value.hasOneUse() || !visited.insert(def).second)
+      if (!def || !hasOneLogicalUse(value) || !visited.insert(def).second)
         return;
       if (auto tensor = dyn_cast<bufferization::ToTensorOp>(def)) {
         auto rowCopy = matchScaledDotRowCopy(tensor);
@@ -3335,7 +3355,8 @@ public:
       return tiled.getResult(0);
     }
     if (auto transpose = dyn_cast_or_null<linalg::TransposeOp>(def);
-        tileBulkLoads && transpose && transpose.hasPureTensorSemantics()) {
+        tileBulkLoads && transpose && transpose.hasPureTensorSemantics() &&
+        canTileTransposeInput(transpose.getInput())) {
       ArrayRef<int64_t> permutation = transpose.getPermutation();
       SmallVector<OpFoldResult> inputOffsets(offsets.size());
       SmallVector<OpFoldResult> inputSizes(sizes.size());
@@ -3411,6 +3432,48 @@ public:
   }
 
 private:
+  bool hasOneLogicalUse(Value value) const {
+    unsigned uses = llvm::count(pendingDotUses, value);
+    for (Operation *user : value.getUsers())
+      if (!replacedTransposes.contains(user))
+        ++uses;
+    return uses == 1;
+  }
+
+  // Push a transpose through a slice only when every tensor input can be
+  // reconstructed from a tiled load or a uniform value. Slicing an already
+  // materialized snapshot before transposing does not save its storage and
+  // changes the backend's subblock layout of that snapshot.
+  bool canTileTransposeInput(Value source) const {
+    Operation *def = source.getDefiningOp();
+    if (!def)
+      return false;
+    if (auto tensor = dyn_cast<bufferization::ToTensorOp>(def))
+      return eligibleCopies.contains(tensor) ||
+             eligibleBulkCopies.contains(tensor);
+    if (auto call = dyn_cast<func::CallOp>(def))
+      return eligibleLoads.contains(call);
+    if (isa<triton::SplatOp>(def))
+      return true;
+    if (auto constant = dyn_cast<arith::ConstantOp>(def)) {
+      auto value = dyn_cast<DenseElementsAttr>(constant.getValue());
+      return value && value.isSplat();
+    }
+    if (auto broadcast = dyn_cast<triton::BroadcastOp>(def))
+      return canTileTransposeInput(broadcast.getSrc());
+    if (auto expand = dyn_cast<triton::ExpandDimsOp>(def))
+      return canTileTransposeInput(expand.getSrc());
+    if (def->getNumResults() != 1 || def->getNumRegions() != 0 ||
+        !def->hasTrait<OpTrait::Elementwise>() || !isMemoryEffectFree(def))
+      return false;
+    auto type = cast<RankedTensorType>(source.getType());
+    return llvm::all_of(def->getOperands(), [&](Value operand) {
+      auto operandType = dyn_cast<RankedTensorType>(operand.getType());
+      return !operandType || (operandType.getShape() == type.getShape() &&
+                              canTileTransposeInput(operand));
+    });
+  }
+
   static bool isNonvolatileIndirectLoad(func::CallOp call) {
     auto volatility = call->getAttrOfType<BoolAttr>("isVolatile");
     return call.getCallee().starts_with("triton_indirect_load") && volatility &&
@@ -3466,9 +3529,9 @@ private:
   }
 
   bool canTileLoad(func::CallOp call) const {
-    if (!isNonvolatileIndirectLoad(call) || !call->hasOneUse() ||
-        call->getBlock() != dot->getBlock() || call.getNumResults() != 1 ||
-        call.getNumOperands() < 2 ||
+    if (!isNonvolatileIndirectLoad(call) || call.getNumResults() != 1 ||
+        !hasOneLogicalUse(call.getResult(0)) ||
+        call->getBlock() != dot->getBlock() || call.getNumOperands() < 2 ||
         !isa<MemRefType>(call.getOperand(0).getType()))
       return false;
     auto resultType = dyn_cast<RankedTensorType>(call.getResult(0).getType());
@@ -3502,6 +3565,8 @@ private:
   triton::DotScaledOp dot;
   ConversionPatternRewriter &rewriter;
   bool tileBulkLoads;
+  SmallVector<Value, 4> pendingDotUses;
+  llvm::SmallPtrSet<Operation *, 4> replacedTransposes;
   llvm::SmallPtrSet<Operation *, 2> eligibleLoads;
   llvm::SmallPtrSet<Operation *, 2> replacedLoads;
   llvm::SmallPtrSet<Operation *, 2> eligibleCopies;
@@ -3714,7 +3779,8 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
     // the software path's established load layout: its vector subblock
     // partitioning is independent of native MX tile assembly.
     ScaledDotLoadTiler loadTiler(op, rewriter, /*tileBulkLoads=*/useNativeMx);
-    loadTiler.prepare({lhs, rhs, lhsScale, rhsScale});
+    loadTiler.prepare({op.getA(), op.getB(), op.getAScale(), op.getBScale()},
+                      {lhs, rhs, lhsScale, rhsScale});
     auto slice = [&](OpBuilder &builder, Value source, Value row, Value col,
                      int64_t rows, int64_t cols) -> Value {
       SmallVector<OpFoldResult> offsets{row, col};
