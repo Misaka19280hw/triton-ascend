@@ -1,16 +1,23 @@
 // RUN: triton-opt --triton-to-linalg="named-ops=True" --split-input-file %s | FileCheck %s
 
-// Native outer tiling requires a reachable, eligible indirect load whose
-// address tensor actually shrinks. All negative controls retain real inputs.
+// Bound eligible indirect reads at their original snapshot location. Native
+// MX and its accumulator remain whole; no result assembly loop is introduced.
 
 // -----
 
 // CHECK-LABEL: func.func @native_indirect_lhs
-// CHECK-NOT: call @triton_indirect_load{{.*}} -> tensor<64x128xf8E4M3FN>
+// CHECK: %[[SNAP0:[^ ]+]] = memref.alloc() : memref<64x128xf8E4M3FN>
 // CHECK: scf.for
-// CHECK: call @triton_indirect_load{{.*}} -> tensor<32x128xf8E4M3FN>
+// CHECK: call @triton_indirect_load{{.*}} -> tensor<1x128xf8E4M3FN>
+// CHECK: memref.subview %[[SNAP0]]{{.*}} [1, 128] [1, 1]
+// CHECK: bufferization.materialize_in_destination
+// CHECK: bufferization.to_tensor %[[SNAP0]] restrict writable : memref<64x128xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK-NOT: tensor.insert_slice
 // CHECK: hfusion.matmul_mx
-// CHECK: tensor.insert_slice
+// CHECK-SAME: tensor<64x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>
+// CHECK-SAME: outs({{.*}} : tensor<64x64xf32>) -> tensor<64x64xf32>
+// CHECK-NOT: tensor.insert_slice
 // CHECK: return
 func.func private @triton_indirect_load(memref<?xf8E4M3FN>, tensor<64x128xi64>) -> tensor<64x128xf8E4M3FN> attributes {isVolatile = false}
 func.func @native_indirect_lhs(%base: memref<?xf8E4M3FN>, %offsets: tensor<64x128xi64>, %b: tensor<128x64xf8E4M3FN>, %c: tensor<64x64xf32>) -> tensor<64x64xf32> {
@@ -159,11 +166,18 @@ func.func @native_lowered_broadcast_snapshot(%base: memref<?xf8E4M3FN>, %offsets
 // -----
 
 // CHECK-LABEL: func.func @native_indirect_rhs
-// CHECK-NOT: call @triton_indirect_load{{.*}} -> tensor<128x64xf8E4M3FN>
+// CHECK: %[[SNAP0:[^ ]+]] = memref.alloc() : memref<128x64xf8E4M3FN>
 // CHECK: scf.for
-// CHECK: call @triton_indirect_load{{.*}} -> tensor<128x32xf8E4M3FN>
+// CHECK: call @triton_indirect_load{{.*}} -> tensor<1x64xf8E4M3FN>
+// CHECK: memref.subview %[[SNAP0]]{{.*}} [1, 64] [1, 1]
+// CHECK: bufferization.materialize_in_destination
+// CHECK: bufferization.to_tensor %[[SNAP0]] restrict writable : memref<128x64xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK-NOT: tensor.insert_slice
 // CHECK: hfusion.matmul_mx
-// CHECK: tensor.insert_slice
+// CHECK-SAME: tensor<16x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>
+// CHECK-SAME: outs({{.*}} : tensor<16x64xf32>) -> tensor<16x64xf32>
+// CHECK-NOT: tensor.insert_slice
 // CHECK: return
 func.func private @triton_indirect_load(memref<?xf8E4M3FN>, tensor<128x64xi64>) -> tensor<128x64xf8E4M3FN> attributes {isVolatile = false}
 func.func @native_indirect_rhs(%base: memref<?xf8E4M3FN>, %offsets: tensor<128x64xi64>, %a: tensor<16x128xf8E4M3FN>, %c: tensor<16x64xf32>) -> tensor<16x64xf32> {
@@ -175,18 +189,20 @@ func.func @native_indirect_rhs(%base: memref<?xf8E4M3FN>, %offsets: tensor<128x6
 // -----
 
 // CHECK-LABEL: func.func @native_triggered_bulk_plain
-// CHECK-SAME: %[[BBASE:[^ :]+]]: memref<?xf8E4M3FN>, %{{[^ ]+}}: tensor<64x64xf32>, %[[STRIDE:[^ :]+]]: index
-// CHECK: %[[FIVE:[^ ]+]] = arith.constant 5 : index
-// CHECK-NOT: memref.alloc() : memref<64x128xf8E4M3FN>
+// CHECK: memref.copy {{.*}} to memref<64x128xf8E4M3FN>
+// CHECK: linalg.transpose {{.*}} tensor<64x128xf8E4M3FN>{{.*}}tensor<128x64xf8E4M3FN>
+// CHECK: %[[SNAP0:[^ ]+]] = memref.alloc() : memref<64x128xf8E4M3FN>
 // CHECK: scf.for
-// CHECK: scf.for %[[N:[^ ]+]]
-// CHECK: call @triton_indirect_load{{.*}} -> tensor<32x128xf8E4M3FN>
-// CHECK: %[[ROW:[^ ]+]] = arith.muli %[[N]], %[[STRIDE]] : index
-// CHECK: %[[OFFSET:[^ ]+]] = arith.addi %[[ROW]], %[[FIVE]] : index
-// CHECK: memref.reinterpret_cast %[[BBASE]] to offset: [%[[OFFSET]]], sizes: [32, 128], strides: [%[[STRIDE]], 2]
-// CHECK: memref.alloc() : memref<32x128xf8E4M3FN>
-// CHECK: linalg.transpose {{.*}} tensor<32x128xf8E4M3FN>{{.*}}tensor<128x32xf8E4M3FN>
+// CHECK: call @triton_indirect_load{{.*}} -> tensor<1x128xf8E4M3FN>
+// CHECK: memref.subview %[[SNAP0]]{{.*}} [1, 128] [1, 1]
+// CHECK: bufferization.materialize_in_destination
+// CHECK: bufferization.to_tensor %[[SNAP0]] restrict writable : memref<64x128xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK-NOT: tensor.insert_slice
 // CHECK: hfusion.matmul_mx
+// CHECK-SAME: tensor<64x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>
+// CHECK-SAME: outs({{.*}} : tensor<64x64xf32>) -> tensor<64x64xf32>
+// CHECK-NOT: tensor.insert_slice
 // CHECK: return
 func.func private @triton_indirect_load(memref<?xf8E4M3FN>, tensor<64x128xi64>) -> tensor<64x128xf8E4M3FN> attributes {isVolatile = false}
 func.func @native_triggered_bulk_plain(%base: memref<?xf8E4M3FN>, %offsets: tensor<64x128xi64>, %bbase: memref<?xf8E4M3FN>, %c: tensor<64x64xf32>, %row_stride: index) -> tensor<64x64xf32> {
@@ -206,14 +222,20 @@ func.func @native_triggered_bulk_plain(%base: memref<?xf8E4M3FN>, %offsets: tens
 // -----
 
 // CHECK-LABEL: func.func @native_triggered_bulk_volatile
-// CHECK: memref.alloc() : memref<64x128xf8E4M3FN>
-// CHECK: %[[FULL:.*]] = linalg.transpose {{.*}} tensor<64x128xf8E4M3FN>{{.*}}tensor<128x64xf8E4M3FN>
+// CHECK: memref.copy {{.*}} to memref<64x128xf8E4M3FN>
+// CHECK: linalg.transpose {{.*}} tensor<64x128xf8E4M3FN>{{.*}}tensor<128x64xf8E4M3FN>
+// CHECK: %[[SNAP0:[^ ]+]] = memref.alloc() : memref<64x128xf8E4M3FN>
 // CHECK: scf.for
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
-// CHECK: call @triton_indirect_load{{.*}} -> tensor<32x128xf8E4M3FN>
-// CHECK: tensor.extract_slice %[[FULL]]{{.*}} : tensor<128x64xf8E4M3FN> to tensor<128x32xf8E4M3FN>
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
+// CHECK: call @triton_indirect_load{{.*}} -> tensor<1x128xf8E4M3FN>
+// CHECK: memref.subview %[[SNAP0]]{{.*}} [1, 128] [1, 1]
+// CHECK: bufferization.materialize_in_destination
+// CHECK: bufferization.to_tensor %[[SNAP0]] restrict writable : memref<64x128xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK-NOT: tensor.insert_slice
 // CHECK: hfusion.matmul_mx
+// CHECK-SAME: tensor<64x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>
+// CHECK-SAME: outs({{.*}} : tensor<64x64xf32>) -> tensor<64x64xf32>
+// CHECK-NOT: tensor.insert_slice
 // CHECK: return
 func.func private @triton_indirect_load(memref<?xf8E4M3FN>, tensor<64x128xi64>) -> tensor<64x128xf8E4M3FN> attributes {isVolatile = false}
 func.func @native_triggered_bulk_volatile(%base: memref<?xf8E4M3FN>, %offsets: tensor<64x128xi64>, %bbase: memref<?xf8E4M3FN>, %c: tensor<64x64xf32>) -> tensor<64x64xf32> {
@@ -233,14 +255,20 @@ func.func @native_triggered_bulk_volatile(%base: memref<?xf8E4M3FN>, %offsets: t
 // -----
 
 // CHECK-LABEL: func.func @native_triggered_bulk_unmarked
-// CHECK: memref.alloc() : memref<64x128xf8E4M3FN>
-// CHECK: %[[FULL:.*]] = linalg.transpose {{.*}} tensor<64x128xf8E4M3FN>{{.*}}tensor<128x64xf8E4M3FN>
+// CHECK: memref.copy {{.*}} to memref<64x128xf8E4M3FN>
+// CHECK: linalg.transpose {{.*}} tensor<64x128xf8E4M3FN>{{.*}}tensor<128x64xf8E4M3FN>
+// CHECK: %[[SNAP0:[^ ]+]] = memref.alloc() : memref<64x128xf8E4M3FN>
 // CHECK: scf.for
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
-// CHECK: call @triton_indirect_load{{.*}} -> tensor<32x128xf8E4M3FN>
-// CHECK: tensor.extract_slice %[[FULL]]{{.*}} : tensor<128x64xf8E4M3FN> to tensor<128x32xf8E4M3FN>
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
+// CHECK: call @triton_indirect_load{{.*}} -> tensor<1x128xf8E4M3FN>
+// CHECK: memref.subview %[[SNAP0]]{{.*}} [1, 128] [1, 1]
+// CHECK: bufferization.materialize_in_destination
+// CHECK: bufferization.to_tensor %[[SNAP0]] restrict writable : memref<64x128xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK-NOT: tensor.insert_slice
 // CHECK: hfusion.matmul_mx
+// CHECK-SAME: tensor<64x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>
+// CHECK-SAME: outs({{.*}} : tensor<64x64xf32>) -> tensor<64x64xf32>
+// CHECK-NOT: tensor.insert_slice
 // CHECK: return
 func.func private @triton_indirect_load(memref<?xf8E4M3FN>, tensor<64x128xi64>) -> tensor<64x128xf8E4M3FN> attributes {isVolatile = false}
 func.func @native_triggered_bulk_unmarked(%base: memref<?xf8E4M3FN>, %offsets: tensor<64x128xi64>, %bbase: memref<?xf8E4M3FN>, %c: tensor<64x64xf32>) -> tensor<64x64xf32> {
@@ -260,14 +288,20 @@ func.func @native_triggered_bulk_unmarked(%base: memref<?xf8E4M3FN>, %offsets: t
 // -----
 
 // CHECK-LABEL: func.func @native_triggered_bulk_shared
-// CHECK: memref.alloc() : memref<64x128xf8E4M3FN>
-// CHECK: %[[FULL:.*]] = linalg.transpose {{.*}} tensor<64x128xf8E4M3FN>{{.*}}tensor<128x64xf8E4M3FN>
+// CHECK: memref.copy {{.*}} to memref<64x128xf8E4M3FN>
+// CHECK: linalg.transpose {{.*}} tensor<64x128xf8E4M3FN>{{.*}}tensor<128x64xf8E4M3FN>
+// CHECK: %[[SNAP0:[^ ]+]] = memref.alloc() : memref<64x128xf8E4M3FN>
 // CHECK: scf.for
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
-// CHECK: call @triton_indirect_load{{.*}} -> tensor<32x128xf8E4M3FN>
-// CHECK: tensor.extract_slice %[[FULL]]{{.*}} : tensor<128x64xf8E4M3FN> to tensor<128x32xf8E4M3FN>
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
+// CHECK: call @triton_indirect_load{{.*}} -> tensor<1x128xf8E4M3FN>
+// CHECK: memref.subview %[[SNAP0]]{{.*}} [1, 128] [1, 1]
+// CHECK: bufferization.materialize_in_destination
+// CHECK: bufferization.to_tensor %[[SNAP0]] restrict writable : memref<64x128xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK-NOT: tensor.insert_slice
 // CHECK: hfusion.matmul_mx
+// CHECK-SAME: tensor<64x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>
+// CHECK-SAME: outs({{.*}} : tensor<64x64xf32>) -> tensor<64x64xf32>
+// CHECK-NOT: tensor.insert_slice
 // CHECK: return
 func.func private @triton_indirect_load(memref<?xf8E4M3FN>, tensor<64x128xi64>) -> tensor<64x128xf8E4M3FN> attributes {isVolatile = false}
 func.func @native_triggered_bulk_shared(%base: memref<?xf8E4M3FN>, %offsets: tensor<64x128xi64>, %bbase: memref<?xf8E4M3FN>, %c: tensor<64x64xf32>) -> (tensor<64x64xf32>, tensor<64x128xf8E4M3FN>) {
@@ -287,14 +321,20 @@ func.func @native_triggered_bulk_shared(%base: memref<?xf8E4M3FN>, %offsets: ten
 // -----
 
 // CHECK-LABEL: func.func @native_triggered_bulk_alias_write
-// CHECK: memref.alloc() : memref<64x128xf8E4M3FN>
-// CHECK: %[[FULL:.*]] = linalg.transpose {{.*}} tensor<64x128xf8E4M3FN>{{.*}}tensor<128x64xf8E4M3FN>
+// CHECK: memref.copy {{.*}} to memref<64x128xf8E4M3FN>
+// CHECK: linalg.transpose {{.*}} tensor<64x128xf8E4M3FN>{{.*}}tensor<128x64xf8E4M3FN>
+// CHECK: %[[SNAP0:[^ ]+]] = memref.alloc() : memref<64x128xf8E4M3FN>
 // CHECK: scf.for
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
-// CHECK: call @triton_indirect_load{{.*}} -> tensor<32x128xf8E4M3FN>
-// CHECK: tensor.extract_slice %[[FULL]]{{.*}} : tensor<128x64xf8E4M3FN> to tensor<128x32xf8E4M3FN>
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
+// CHECK: call @triton_indirect_load{{.*}} -> tensor<1x128xf8E4M3FN>
+// CHECK: memref.subview %[[SNAP0]]{{.*}} [1, 128] [1, 1]
+// CHECK: bufferization.materialize_in_destination
+// CHECK: bufferization.to_tensor %[[SNAP0]] restrict writable : memref<64x128xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK-NOT: tensor.insert_slice
 // CHECK: hfusion.matmul_mx
+// CHECK-SAME: tensor<64x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>
+// CHECK-SAME: outs({{.*}} : tensor<64x64xf32>) -> tensor<64x64xf32>
+// CHECK-NOT: tensor.insert_slice
 // CHECK: return
 func.func private @triton_indirect_load(memref<?xf8E4M3FN>, tensor<64x128xi64>) -> tensor<64x128xf8E4M3FN> attributes {isVolatile = false}
 func.func @native_triggered_bulk_alias_write(%base: memref<?xf8E4M3FN>, %offsets: tensor<64x128xi64>, %bbase: memref<?xf8E4M3FN>, %c: tensor<64x64xf32>) -> tensor<64x64xf32> {
@@ -315,14 +355,20 @@ func.func @native_triggered_bulk_alias_write(%base: memref<?xf8E4M3FN>, %offsets
 // -----
 
 // CHECK-LABEL: func.func @native_triggered_bulk_unknown_write
-// CHECK: memref.alloc() : memref<64x128xf8E4M3FN>
-// CHECK: %[[FULL:.*]] = linalg.transpose {{.*}} tensor<64x128xf8E4M3FN>{{.*}}tensor<128x64xf8E4M3FN>
+// CHECK: memref.copy {{.*}} to memref<64x128xf8E4M3FN>
+// CHECK: linalg.transpose {{.*}} tensor<64x128xf8E4M3FN>{{.*}}tensor<128x64xf8E4M3FN>
+// CHECK: %[[SNAP0:[^ ]+]] = memref.alloc() : memref<64x128xf8E4M3FN>
 // CHECK: scf.for
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
-// CHECK: call @triton_indirect_load{{.*}} -> tensor<32x128xf8E4M3FN>
-// CHECK: tensor.extract_slice %[[FULL]]{{.*}} : tensor<128x64xf8E4M3FN> to tensor<128x32xf8E4M3FN>
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
+// CHECK: call @triton_indirect_load{{.*}} -> tensor<1x128xf8E4M3FN>
+// CHECK: memref.subview %[[SNAP0]]{{.*}} [1, 128] [1, 1]
+// CHECK: bufferization.materialize_in_destination
+// CHECK: bufferization.to_tensor %[[SNAP0]] restrict writable : memref<64x128xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK-NOT: tensor.insert_slice
 // CHECK: hfusion.matmul_mx
+// CHECK-SAME: tensor<64x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>
+// CHECK-SAME: outs({{.*}} : tensor<64x64xf32>) -> tensor<64x64xf32>
+// CHECK-NOT: tensor.insert_slice
 // CHECK: return
 func.func private @triton_indirect_load(memref<?xf8E4M3FN>, tensor<64x128xi64>) -> tensor<64x128xf8E4M3FN> attributes {isVolatile = false}
 func.func private @write(memref<?xf8E4M3FN>)
@@ -344,12 +390,19 @@ func.func @native_triggered_bulk_unknown_write(%base: memref<?xf8E4M3FN>, %offse
 // -----
 
 // CHECK-LABEL: func.func @native_indirect_transpose
-// CHECK-NOT: call @triton_indirect_load{{.*}} -> tensor<64x128xf8E4M3FN>
+// CHECK: %[[SNAP0:[^ ]+]] = memref.alloc() : memref<64x128xf8E4M3FN>
 // CHECK: scf.for
-// CHECK: call @triton_indirect_load{{.*}} -> tensor<32x128xf8E4M3FN>
-// CHECK: linalg.transpose {{.*}} tensor<32x128xf8E4M3FN>{{.*}}tensor<128x32xf8E4M3FN>
+// CHECK: call @triton_indirect_load{{.*}} -> tensor<1x128xf8E4M3FN>
+// CHECK: memref.subview %[[SNAP0]]{{.*}} [1, 128] [1, 1]
+// CHECK: bufferization.materialize_in_destination
+// CHECK: bufferization.to_tensor %[[SNAP0]] restrict writable : memref<64x128xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK-NOT: tensor.insert_slice
+// CHECK: linalg.transpose {{.*}} tensor<64x128xf8E4M3FN>{{.*}}tensor<128x64xf8E4M3FN>
 // CHECK: hfusion.matmul_mx
-// CHECK: tensor.insert_slice
+// CHECK-SAME: tensor<16x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>
+// CHECK-SAME: outs({{.*}} : tensor<16x64xf32>) -> tensor<16x64xf32>
+// CHECK-NOT: tensor.insert_slice
 // CHECK: return
 func.func private @triton_indirect_load(memref<?xf8E4M3FN>, tensor<64x128xi64>) -> tensor<64x128xf8E4M3FN> attributes {isVolatile = false}
 func.func @native_indirect_transpose(%base: memref<?xf8E4M3FN>, %offsets: tensor<64x128xi64>, %a: tensor<16x128xf8E4M3FN>, %extra: tensor<64x128xf8E4M3FN>, %c: tensor<16x64xf32>) -> tensor<16x64xf32> {
@@ -362,11 +415,19 @@ func.func @native_indirect_transpose(%base: memref<?xf8E4M3FN>, %offsets: tensor
 // -----
 
 // CHECK-LABEL: func.func @native_indirect_transpose_mixed_snapshot
-// CHECK: call @triton_indirect_load{{.*}} -> tensor<64x128xf8E4M3FN>
+// CHECK: %[[SNAP0:[^ ]+]] = memref.alloc() : memref<64x128xf8E4M3FN>
+// CHECK: scf.for
+// CHECK: call @triton_indirect_load{{.*}} -> tensor<1x128xf8E4M3FN>
+// CHECK: memref.subview %[[SNAP0]]{{.*}} [1, 128] [1, 1]
+// CHECK: bufferization.materialize_in_destination
+// CHECK: bufferization.to_tensor %[[SNAP0]] restrict writable : memref<64x128xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK-NOT: tensor.insert_slice
 // CHECK: linalg.transpose {{.*}} tensor<64x128xf8E4M3FN>{{.*}}tensor<128x64xf8E4M3FN>
-// CHECK-NOT: scf.for
 // CHECK: hfusion.matmul_mx
-// CHECK-NOT: scf.for
+// CHECK-SAME: tensor<16x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>
+// CHECK-SAME: outs({{.*}} : tensor<16x64xf32>) -> tensor<16x64xf32>
+// CHECK-NOT: tensor.insert_slice
 // CHECK: return
 func.func private @triton_indirect_load(memref<?xf8E4M3FN>, tensor<64x128xi64>) -> tensor<64x128xf8E4M3FN> attributes {isVolatile = false}
 func.func @native_indirect_transpose_mixed_snapshot(%base: memref<?xf8E4M3FN>, %offsets: tensor<64x128xi64>, %a: tensor<16x128xf8E4M3FN>, %extra: tensor<64x128xf8E4M3FN>, %c: tensor<16x64xf32>) -> tensor<16x64xf32> {
@@ -380,14 +441,20 @@ func.func @native_indirect_transpose_mixed_snapshot(%base: memref<?xf8E4M3FN>, %
 // -----
 
 // CHECK-LABEL: func.func @native_triggered_bulk_nested_write
-// CHECK: memref.alloc() : memref<64x128xf8E4M3FN>
-// CHECK: %[[FULL:.*]] = linalg.transpose {{.*}} tensor<64x128xf8E4M3FN>{{.*}}tensor<128x64xf8E4M3FN>
+// CHECK: memref.copy {{.*}} to memref<64x128xf8E4M3FN>
+// CHECK: linalg.transpose {{.*}} tensor<64x128xf8E4M3FN>{{.*}}tensor<128x64xf8E4M3FN>
+// CHECK: %[[SNAP0:[^ ]+]] = memref.alloc() : memref<64x128xf8E4M3FN>
 // CHECK: scf.for
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
-// CHECK: call @triton_indirect_load{{.*}} -> tensor<32x128xf8E4M3FN>
-// CHECK: tensor.extract_slice %[[FULL]]{{.*}} : tensor<128x64xf8E4M3FN> to tensor<128x32xf8E4M3FN>
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
+// CHECK: call @triton_indirect_load{{.*}} -> tensor<1x128xf8E4M3FN>
+// CHECK: memref.subview %[[SNAP0]]{{.*}} [1, 128] [1, 1]
+// CHECK: bufferization.materialize_in_destination
+// CHECK: bufferization.to_tensor %[[SNAP0]] restrict writable : memref<64x128xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK-NOT: tensor.insert_slice
 // CHECK: hfusion.matmul_mx
+// CHECK-SAME: tensor<64x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>
+// CHECK-SAME: outs({{.*}} : tensor<64x64xf32>) -> tensor<64x64xf32>
+// CHECK-NOT: tensor.insert_slice
 // CHECK: return
 func.func private @triton_indirect_load(memref<?xf8E4M3FN>, tensor<64x128xi64>) -> tensor<64x128xf8E4M3FN> attributes {isVolatile = false}
 func.func @native_triggered_bulk_nested_write(%base: memref<?xf8E4M3FN>, %offsets: tensor<64x128xi64>, %bbase: memref<?xf8E4M3FN>, %c: tensor<64x64xf32>, %condition: i1) -> tensor<64x64xf32> {
@@ -411,14 +478,20 @@ func.func @native_triggered_bulk_nested_write(%base: memref<?xf8E4M3FN>, %offset
 // -----
 
 // CHECK-LABEL: func.func @native_triggered_bulk_escaping_buffer
-// CHECK: memref.alloc() : memref<64x128xf8E4M3FN>
-// CHECK: %[[FULL:.*]] = linalg.transpose {{.*}} tensor<64x128xf8E4M3FN>{{.*}}tensor<128x64xf8E4M3FN>
+// CHECK: memref.copy {{.*}} to memref<64x128xf8E4M3FN>
+// CHECK: linalg.transpose {{.*}} tensor<64x128xf8E4M3FN>{{.*}}tensor<128x64xf8E4M3FN>
+// CHECK: %[[SNAP0:[^ ]+]] = memref.alloc() : memref<64x128xf8E4M3FN>
 // CHECK: scf.for
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
-// CHECK: call @triton_indirect_load{{.*}} -> tensor<32x128xf8E4M3FN>
-// CHECK: tensor.extract_slice %[[FULL]]{{.*}} : tensor<128x64xf8E4M3FN> to tensor<128x32xf8E4M3FN>
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
+// CHECK: call @triton_indirect_load{{.*}} -> tensor<1x128xf8E4M3FN>
+// CHECK: memref.subview %[[SNAP0]]{{.*}} [1, 128] [1, 1]
+// CHECK: bufferization.materialize_in_destination
+// CHECK: bufferization.to_tensor %[[SNAP0]] restrict writable : memref<64x128xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK-NOT: tensor.insert_slice
 // CHECK: hfusion.matmul_mx
+// CHECK-SAME: tensor<64x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>
+// CHECK-SAME: outs({{.*}} : tensor<64x64xf32>) -> tensor<64x64xf32>
+// CHECK-NOT: tensor.insert_slice
 // CHECK: return
 func.func private @triton_indirect_load(memref<?xf8E4M3FN>, tensor<64x128xi64>) -> tensor<64x128xf8E4M3FN> attributes {isVolatile = false}
 func.func @native_triggered_bulk_escaping_buffer(%base: memref<?xf8E4M3FN>, %offsets: tensor<64x128xi64>, %bbase: memref<?xf8E4M3FN>, %c: tensor<64x64xf32>) -> (tensor<64x64xf32>, memref<64x128xf8E4M3FN>) {
@@ -440,11 +513,18 @@ func.func @native_triggered_bulk_escaping_buffer(%base: memref<?xf8E4M3FN>, %off
 // Reducing N does not reduce this already-small A address tensor.
 
 // CHECK-LABEL: func.func @native_indirect_does_not_shrink
-// CHECK: call @triton_indirect_load{{.*}} -> tensor<16x128xf8E4M3FN>
+// CHECK: %[[SNAP0:[^ ]+]] = memref.alloc() : memref<16x128xf8E4M3FN>
+// CHECK: scf.for
+// CHECK: call @triton_indirect_load{{.*}} -> tensor<1x128xf8E4M3FN>
+// CHECK: memref.subview %[[SNAP0]]{{.*}} [1, 128] [1, 1]
+// CHECK: bufferization.materialize_in_destination
+// CHECK: bufferization.to_tensor %[[SNAP0]] restrict writable : memref<16x128xf8E4M3FN>
 // CHECK-NOT: scf.for
+// CHECK-NOT: tensor.insert_slice
 // CHECK: hfusion.matmul_mx
 // CHECK-SAME: tensor<16x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>
-// CHECK-NOT: scf.for
+// CHECK-SAME: outs({{.*}} : tensor<16x64xf32>) -> tensor<16x64xf32>
+// CHECK-NOT: tensor.insert_slice
 // CHECK: return
 func.func private @triton_indirect_load(memref<?xf8E4M3FN>, tensor<16x128xi64>) -> tensor<16x128xf8E4M3FN> attributes {isVolatile = false}
 func.func @native_indirect_does_not_shrink(%base: memref<?xf8E4M3FN>, %offsets: tensor<16x128xi64>, %b: tensor<128x64xf8E4M3FN>, %c: tensor<16x64xf32>) -> tensor<16x64xf32> {
@@ -457,18 +537,20 @@ func.func @native_indirect_does_not_shrink(%base: memref<?xf8E4M3FN>, %offsets: 
 // -----
 
 // CHECK-LABEL: func.func @native_triggered_bulk_lowered_transpose
-// CHECK-SAME: %[[BBASE:[^ :]+]]: memref<?xf8E4M3FN>, %{{[^ ]+}}: tensor<64x64xf32>, %[[STRIDE:[^ :]+]]: index
-// CHECK: %[[FIVE:[^ ]+]] = arith.constant 5 : index
-// CHECK-NOT: memref.alloc() : memref<64x128xf8E4M3FN>
+// CHECK: memref.copy {{.*}} to memref<64x128xf8E4M3FN>
+// CHECK: linalg.transpose {{.*}} tensor<64x128xf8E4M3FN>{{.*}}tensor<128x64xf8E4M3FN>
+// CHECK: %[[SNAP0:[^ ]+]] = memref.alloc() : memref<64x128xf8E4M3FN>
 // CHECK: scf.for
-// CHECK: scf.for %[[N:[^ ]+]]
-// CHECK: call @triton_indirect_load{{.*}} -> tensor<32x128xf8E4M3FN>
-// CHECK: %[[ROW:[^ ]+]] = arith.muli %[[N]], %[[STRIDE]] : index
-// CHECK: %[[OFFSET:[^ ]+]] = arith.addi %[[ROW]], %[[FIVE]] : index
-// CHECK: memref.reinterpret_cast %[[BBASE]] to offset: [%[[OFFSET]]], sizes: [32, 128], strides: [%[[STRIDE]], 2]
-// CHECK: memref.alloc() : memref<32x128xf8E4M3FN>
-// CHECK: linalg.transpose {{.*}} tensor<32x128xf8E4M3FN>{{.*}}tensor<128x32xf8E4M3FN>
+// CHECK: call @triton_indirect_load{{.*}} -> tensor<1x128xf8E4M3FN>
+// CHECK: memref.subview %[[SNAP0]]{{.*}} [1, 128] [1, 1]
+// CHECK: bufferization.materialize_in_destination
+// CHECK: bufferization.to_tensor %[[SNAP0]] restrict writable : memref<64x128xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK-NOT: tensor.insert_slice
 // CHECK: hfusion.matmul_mx
+// CHECK-SAME: tensor<64x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>
+// CHECK-SAME: outs({{.*}} : tensor<64x64xf32>) -> tensor<64x64xf32>
+// CHECK-NOT: tensor.insert_slice
 // CHECK: return
 func.func private @triton_indirect_load(memref<?xf8E4M3FN>, tensor<64x128xi64>) -> tensor<64x128xf8E4M3FN> attributes {isVolatile = false}
 func.func @native_triggered_bulk_lowered_transpose(%base: memref<?xf8E4M3FN>, %offsets: tensor<64x128xi64>, %bbase: memref<?xf8E4M3FN>, %c: tensor<64x64xf32>, %row_stride: index) -> tensor<64x64xf32> {
@@ -489,24 +571,33 @@ func.func @native_triggered_bulk_lowered_transpose(%base: memref<?xf8E4M3FN>, %o
 // -----
 
 // CHECK-LABEL: func.func @native_triggered_bulk_two_dot_users
-// CHECK: memref.alloc() : memref<64x128xf8E4M3FN>
+// CHECK: memref.copy {{.*}} to memref<64x128xf8E4M3FN>
 // CHECK: linalg.transpose {{.*}} tensor<64x128xf8E4M3FN>{{.*}}tensor<128x64xf8E4M3FN>
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
+// CHECK: %[[SNAP0:[^ ]+]] = memref.alloc() : memref<64x128xf8E4M3FN>
 // CHECK: scf.for
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
-// CHECK: call @triton_indirect_load{{.*}} -> tensor<32x128xf8E4M3FN>
-// CHECK: tensor.extract_slice {{.*}} : tensor<128x64xf8E4M3FN> to tensor<128x32xf8E4M3FN>
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
+// CHECK: call @triton_indirect_load{{.*}} -> tensor<1x128xf8E4M3FN>
+// CHECK: memref.subview %[[SNAP0]]{{.*}} [1, 128] [1, 1]
+// CHECK: bufferization.materialize_in_destination
+// CHECK: bufferization.to_tensor %[[SNAP0]] restrict writable : memref<64x128xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK-NOT: tensor.insert_slice
 // CHECK: hfusion.matmul_mx
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
+// CHECK-SAME: tensor<64x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>
+// CHECK-SAME: outs({{.*}} : tensor<64x64xf32>) -> tensor<64x64xf32>
+// CHECK-NOT: tensor.insert_slice
+// CHECK: %[[SNAP1:[^ ]+]] = memref.alloc() : memref<64x128xf8E4M3FN>
 // CHECK: scf.for
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
-// CHECK: call @triton_indirect_load{{.*}} -> tensor<32x128xf8E4M3FN>
-// CHECK: tensor.extract_slice {{.*}} : tensor<128x64xf8E4M3FN> to tensor<128x32xf8E4M3FN>
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
+// CHECK: call @triton_indirect_load{{.*}} -> tensor<1x128xf8E4M3FN>
+// CHECK: memref.subview %[[SNAP1]]{{.*}} [1, 128] [1, 1]
+// CHECK: bufferization.materialize_in_destination
+// CHECK: bufferization.to_tensor %[[SNAP1]] restrict writable : memref<64x128xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK-NOT: tensor.insert_slice
 // CHECK: hfusion.matmul_mx
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
-// CHECK: return {{.*}} : tensor<64x64xf32>, tensor<64x64xf32>
+// CHECK-SAME: tensor<64x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>
+// CHECK-SAME: outs({{.*}} : tensor<64x64xf32>) -> tensor<64x64xf32>
+// CHECK-NOT: tensor.insert_slice
+// CHECK: return
 func.func private @triton_indirect_load(memref<?xf8E4M3FN>, tensor<64x128xi64>) -> tensor<64x128xf8E4M3FN> attributes {isVolatile = false}
 func.func @native_triggered_bulk_two_dot_users(%base: memref<?xf8E4M3FN>, %offsets: tensor<64x128xi64>, %bbase: memref<?xf8E4M3FN>, %c: tensor<64x64xf32>, %row_stride: index) -> (tensor<64x64xf32>, tensor<64x64xf32>) {
   %zero = arith.constant 0 : index
@@ -528,24 +619,33 @@ func.func @native_triggered_bulk_two_dot_users(%base: memref<?xf8E4M3FN>, %offse
 // -----
 
 // CHECK-LABEL: func.func @native_triggered_bulk_extra_transpose_user
-// CHECK: memref.alloc() : memref<64x128xf8E4M3FN>
+// CHECK: memref.copy {{.*}} to memref<64x128xf8E4M3FN>
 // CHECK: linalg.transpose {{.*}} tensor<64x128xf8E4M3FN>{{.*}}tensor<128x64xf8E4M3FN>
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
+// CHECK: %[[SNAP0:[^ ]+]] = memref.alloc() : memref<64x128xf8E4M3FN>
 // CHECK: scf.for
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
-// CHECK: call @triton_indirect_load{{.*}} -> tensor<32x128xf8E4M3FN>
-// CHECK: tensor.extract_slice {{.*}} : tensor<128x64xf8E4M3FN> to tensor<128x32xf8E4M3FN>
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
+// CHECK: call @triton_indirect_load{{.*}} -> tensor<1x128xf8E4M3FN>
+// CHECK: memref.subview %[[SNAP0]]{{.*}} [1, 128] [1, 1]
+// CHECK: bufferization.materialize_in_destination
+// CHECK: bufferization.to_tensor %[[SNAP0]] restrict writable : memref<64x128xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK-NOT: tensor.insert_slice
 // CHECK: hfusion.matmul_mx
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
+// CHECK-SAME: tensor<64x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>
+// CHECK-SAME: outs({{.*}} : tensor<64x64xf32>) -> tensor<64x64xf32>
+// CHECK-NOT: tensor.insert_slice
+// CHECK: %[[SNAP1:[^ ]+]] = memref.alloc() : memref<64x128xf8E4M3FN>
 // CHECK: scf.for
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
-// CHECK: call @triton_indirect_load{{.*}} -> tensor<32x128xf8E4M3FN>
-// CHECK: tensor.extract_slice {{.*}} : tensor<128x64xf8E4M3FN> to tensor<128x32xf8E4M3FN>
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
+// CHECK: call @triton_indirect_load{{.*}} -> tensor<1x128xf8E4M3FN>
+// CHECK: memref.subview %[[SNAP1]]{{.*}} [1, 128] [1, 1]
+// CHECK: bufferization.materialize_in_destination
+// CHECK: bufferization.to_tensor %[[SNAP1]] restrict writable : memref<64x128xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK-NOT: tensor.insert_slice
 // CHECK: hfusion.matmul_mx
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
-// CHECK: return {{.*}} : tensor<64x64xf32>, tensor<64x64xf32>
+// CHECK-SAME: tensor<64x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>
+// CHECK-SAME: outs({{.*}} : tensor<64x64xf32>) -> tensor<64x64xf32>
+// CHECK-NOT: tensor.insert_slice
+// CHECK: return
 func.func private @triton_indirect_load(memref<?xf8E4M3FN>, tensor<64x128xi64>) -> tensor<64x128xf8E4M3FN> attributes {isVolatile = false}
 func.func @native_triggered_bulk_extra_transpose_user(%base: memref<?xf8E4M3FN>, %offsets: tensor<64x128xi64>, %bbase: memref<?xf8E4M3FN>, %c: tensor<64x64xf32>, %row_stride: index) -> (tensor<64x64xf32>, tensor<64x64xf32>) {
   %zero = arith.constant 0 : index
