@@ -264,19 +264,15 @@ func.func @bulk_transpose_unproven(%src: memref<64x128xf8E4M3FN, strided<[?, 2],
 
 // -----
 
+// Bulk sinking is specific to native MX. The software path keeps its full
+// snapshot, including the original dynamic stride and nonzero source origin.
 // CHECK-LABEL: func.func @bulk_both_axes
-// CHECK-SAME: %[[BASE:.*]]: memref<?xf16>, %[[STRIDE:.*]]: index
-// CHECK-DAG: %[[ORIGIN:.*]] = arith.constant 5 : index
-// CHECK-DAG: %[[TWO:.*]] = arith.constant 2 : index
-// CHECK-NOT: memref.alloc() : memref<64x64xf16>
-// CHECK: scf.for %[[N:[^ ]+]] =
-// CHECK: scf.for %[[K:[^ ]+]] =
-// CHECK: %[[ROW:.*]] = arith.muli %[[K]], %[[STRIDE]] : index
-// CHECK: %[[ROWBASE:.*]] = arith.addi %[[ROW]], %[[ORIGIN]] : index
-// CHECK: %[[COL:.*]] = arith.muli %[[N]], %[[TWO]] : index
-// CHECK: %[[OFFSET:.*]] = arith.addi %[[ROWBASE]], %[[COL]] : index
-// CHECK: memref.reinterpret_cast %[[BASE]] to offset: [%[[OFFSET]]], sizes: [32, 32], strides: [%[[STRIDE]], 2]
-// CHECK: memref.alloc() : memref<32x32xf16>
+// CHECK: memref.reinterpret_cast {{.*}} sizes: [64, 64], strides: [{{.*}}, 2]
+// CHECK: memref.alloc() : memref<64x64xf16>
+// CHECK: memref.copy {{.*}} {isVolatile = false}
+// CHECK: scf.for
+// CHECK: tensor.extract_slice {{.*}} : tensor<64x64xf16> to tensor<32x32xf16>
+// CHECK-NOT: memref.alloc() : memref<32x32xf16>
 // CHECK: linalg.matmul
 func.func @bulk_both_axes(%base: memref<?xf16>, %row_stride: index, %a: tensor<16x64xf16>, %c: tensor<16x64xf32>) -> tensor<16x64xf32> {
   %base_offset = arith.constant 5 : index

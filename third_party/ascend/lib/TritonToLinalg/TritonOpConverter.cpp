@@ -3178,8 +3178,8 @@ matchScaledDotRowCopy(bufferization::ToTensorOp tensor) {
 class ScaledDotLoadTiler {
 public:
   ScaledDotLoadTiler(triton::DotScaledOp dot,
-                     ConversionPatternRewriter &rewriter)
-      : dot(dot), rewriter(rewriter) {}
+                     ConversionPatternRewriter &rewriter, bool tileBulkLoads)
+      : dot(dot), rewriter(rewriter), tileBulkLoads(tileBulkLoads) {}
 
   void prepare(ArrayRef<Value> sources) {
     llvm::SmallPtrSet<Operation *, 16> visited;
@@ -3192,10 +3192,12 @@ public:
         if (rowCopy && tensor->getBlock() == dot->getBlock() &&
             canCrossToDot(rowCopy->loop))
           eligibleCopies.insert(tensor);
-        auto bulkCopy = matchScaledDotBulkCopy(tensor);
-        if (bulkCopy && tensor->getBlock() == dot->getBlock() &&
-            canCrossToDot(bulkCopy))
-          eligibleBulkCopies.insert(tensor);
+        if (tileBulkLoads) {
+          auto bulkCopy = matchScaledDotBulkCopy(tensor);
+          if (bulkCopy && tensor->getBlock() == dot->getBlock() &&
+              canCrossToDot(bulkCopy))
+            eligibleBulkCopies.insert(tensor);
+        }
         return;
       }
       if (auto call = dyn_cast<func::CallOp>(def)) {
@@ -3333,7 +3335,7 @@ public:
       return tiled.getResult(0);
     }
     if (auto transpose = dyn_cast_or_null<linalg::TransposeOp>(def);
-        transpose && transpose.hasPureTensorSemantics()) {
+        tileBulkLoads && transpose && transpose.hasPureTensorSemantics()) {
       ArrayRef<int64_t> permutation = transpose.getPermutation();
       SmallVector<OpFoldResult> inputOffsets(offsets.size());
       SmallVector<OpFoldResult> inputSizes(sizes.size());
@@ -3499,6 +3501,7 @@ private:
 
   triton::DotScaledOp dot;
   ConversionPatternRewriter &rewriter;
+  bool tileBulkLoads;
   llvm::SmallPtrSet<Operation *, 2> eligibleLoads;
   llvm::SmallPtrSet<Operation *, 2> replacedLoads;
   llvm::SmallPtrSet<Operation *, 2> eligibleCopies;
@@ -3707,7 +3710,10 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
       Value factor = builder.create<arith::ConstantIndexOp>(loc, divisor);
       return builder.create<arith::DivUIOp>(loc, index, factor);
     };
-    ScaledDotLoadTiler loadTiler(op, rewriter);
+    // Bulk-copy and transpose sinking bounds native MX input storage. Keep
+    // the software path's established load layout: its vector subblock
+    // partitioning is independent of native MX tile assembly.
+    ScaledDotLoadTiler loadTiler(op, rewriter, /*tileBulkLoads=*/useNativeMx);
     loadTiler.prepare({lhs, rhs, lhsScale, rhsScale});
     auto slice = [&](OpBuilder &builder, Value source, Value row, Value col,
                      int64_t rows, int64_t cols) -> Value {
