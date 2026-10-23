@@ -3061,6 +3061,45 @@ SortOpConverter::matchAndRewrite(triton::ascend::SortOp op, OpAdaptor adaptor,
 }
 
 namespace {
+static bool isNonvolatileScaledDotCopy(memref::CopyOp copy) {
+  auto volatility = copy->getAttrOfType<BoolAttr>("isVolatile");
+  return volatility && !volatility.getValue();
+}
+
+// A full unmasked load can also lower to one strided memref.copy. Its private
+// destination must not escape: replacing the read with tile reads must remove
+// the original snapshot, rather than leave both full and tiled buffers live.
+static memref::CopyOp matchScaledDotBulkCopy(bufferization::ToTensorOp tensor) {
+  auto allocation = tensor.getBuffer().getDefiningOp<memref::AllocOp>();
+  if (!allocation || allocation->getBlock() != tensor->getBlock() ||
+      allocation.getType().getRank() != 2 ||
+      !allocation.getType().hasStaticShape() ||
+      !allocation.getType().getLayout().isIdentity() ||
+      allocation.getType().getMemorySpace())
+    return nullptr;
+  memref::CopyOp copy;
+  for (Operation *user : allocation->getUsers()) {
+    if (user == tensor)
+      continue;
+    if (copy || !(copy = dyn_cast<memref::CopyOp>(user)) ||
+        copy.getTarget() != allocation.getResult())
+      return nullptr;
+  }
+  if (!copy || !isNonvolatileScaledDotCopy(copy) ||
+      copy->getBlock() != tensor->getBlock() ||
+      !allocation->isBeforeInBlock(copy) || !copy->isBeforeInBlock(tensor))
+    return nullptr;
+  auto sourceType = dyn_cast<MemRefType>(copy.getSource().getType());
+  if (!sourceType || sourceType.getShape() != allocation.getType().getShape() ||
+      sourceType.getElementType() != allocation.getType().getElementType())
+    return nullptr;
+  SmallVector<int64_t> strides;
+  int64_t offset;
+  if (failed(sourceType.getStridesAndOffset(strides, offset)))
+    return nullptr;
+  return copy;
+}
+
 struct ScaledDotRowCopy {
   memref::AllocOp allocation;
   scf::ForOp loop;
@@ -3091,7 +3130,8 @@ matchScaledDotRowCopy(bufferization::ToTensorOp tensor) {
     return std::nullopt;
   auto copy = dyn_cast<memref::CopyOp>(*destination->getUsers().begin());
   auto loop = destination->getParentOfType<scf::ForOp>();
-  if (!copy || !loop || copy.getTarget() != destination.getResult() ||
+  if (!copy || !isNonvolatileScaledDotCopy(copy) || !loop ||
+      copy.getTarget() != destination.getResult() ||
       loop->getBlock() != tensor->getBlock() ||
       !loop->hasAttr("ExtractedLoadOrStore") ||
       loop.getNumRegionIterArgs() != 0 ||
@@ -3150,6 +3190,10 @@ public:
         if (rowCopy && tensor->getBlock() == dot->getBlock() &&
             canCrossToDot(rowCopy->loop))
           eligibleCopies.insert(tensor);
+        auto bulkCopy = matchScaledDotBulkCopy(tensor);
+        if (bulkCopy && tensor->getBlock() == dot->getBlock() &&
+            canCrossToDot(bulkCopy))
+          eligibleBulkCopies.insert(tensor);
         return;
       }
       if (auto call = dyn_cast<func::CallOp>(def)) {
@@ -3173,6 +3217,20 @@ public:
       shape.push_back(cast<IntegerAttr>(cast<Attribute>(size)).getInt());
     auto resultType = type.clone(shape);
     Operation *def = source.getDefiningOp();
+    if (auto tensor = dyn_cast_or_null<bufferization::ToTensorOp>(def);
+        tensor && eligibleBulkCopies.contains(tensor)) {
+      auto copy = matchScaledDotBulkCopy(tensor);
+      auto loc = tensor.getLoc();
+      SmallVector<OpFoldResult> strides(sizes.size(), builder.getIndexAttr(1));
+      Value input = builder.create<memref::SubViewOp>(loc, copy.getSource(),
+                                                      offsets, sizes, strides);
+      Value tile = builder.create<memref::AllocOp>(
+          loc, MemRefType::get(shape, type.getElementType()));
+      builder.create<memref::CopyOp>(loc, input, tile);
+      replacedBulkCopies.insert(tensor);
+      return builder.create<bufferization::ToTensorOp>(
+          loc, resultType, tile, /*restrict=*/true, /*writable=*/true);
+    }
     if (auto tensor = dyn_cast_or_null<bufferization::ToTensorOp>(def);
         tensor && eligibleCopies.contains(tensor)) {
       auto rowCopy = *matchScaledDotRowCopy(tensor);
@@ -3255,6 +3313,24 @@ public:
       replacedLoads.insert(call);
       return tiled.getResult(0);
     }
+    if (auto transpose = dyn_cast_or_null<linalg::TransposeOp>(def);
+        transpose && transpose.hasPureTensorSemantics()) {
+      ArrayRef<int64_t> permutation = transpose.getPermutation();
+      SmallVector<OpFoldResult> inputOffsets(offsets.size());
+      SmallVector<OpFoldResult> inputSizes(sizes.size());
+      for (auto [dim, inputDim] : llvm::enumerate(permutation)) {
+        inputOffsets[inputDim] = offsets[dim];
+        inputSizes[inputDim] = sizes[dim];
+      }
+      Value input =
+          slice(builder, transpose.getInput(), inputOffsets, inputSizes);
+      Value output = builder.create<tensor::EmptyOp>(def->getLoc(), shape,
+                                                     type.getElementType());
+      return builder
+          .create<linalg::TransposeOp>(def->getLoc(), input, output,
+                                       permutation)
+          ->getResult(0);
+    }
     if (def && def->getNumResults() == 1 && def->getNumRegions() == 0 &&
         def->hasTrait<OpTrait::Elementwise>() && isMemoryEffectFree(def)) {
       IRMapping mapping;
@@ -3308,6 +3384,9 @@ public:
           matchScaledDotRowCopy(cast<bufferization::ToTensorOp>(tensor));
       rowCopy->loop->setAttr("tt.scaled_dot_tiled", rewriter.getUnitAttr());
     }
+    for (Operation *tensor : replacedBulkCopies)
+      matchScaledDotBulkCopy(cast<bufferization::ToTensorOp>(tensor))
+          ->setAttr("tt.scaled_dot_tiled", rewriter.getUnitAttr());
   }
 
 private:
@@ -3405,6 +3484,8 @@ private:
   llvm::SmallPtrSet<Operation *, 2> replacedLoads;
   llvm::SmallPtrSet<Operation *, 2> eligibleCopies;
   llvm::SmallPtrSet<Operation *, 2> replacedCopies;
+  llvm::SmallPtrSet<Operation *, 2> eligibleBulkCopies;
+  llvm::SmallPtrSet<Operation *, 2> replacedBulkCopies;
 };
 
 struct EraseTiledScaledDotLoad : OpRewritePattern<func::CallOp> {
@@ -3451,11 +3532,36 @@ struct EraseTiledScaledDotCopy : OpRewritePattern<scf::ForOp> {
     return success();
   }
 };
+struct EraseTiledScaledDotBulkCopy : OpRewritePattern<memref::CopyOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(memref::CopyOp copy,
+                                PatternRewriter &rewriter) const override {
+    if (!copy->hasAttr("tt.scaled_dot_tiled"))
+      return failure();
+    auto allocation = copy.getTarget().getDefiningOp<memref::AllocOp>();
+    if (!allocation)
+      return failure();
+    SmallVector<Operation *> deadTensors;
+    for (Operation *user : allocation->getUsers()) {
+      if (user == copy)
+        continue;
+      if (!isa<bufferization::ToTensorOp>(user) || !user->use_empty())
+        return failure();
+      deadTensors.push_back(user);
+    }
+    for (Operation *tensor : deadTensors)
+      rewriter.eraseOp(tensor);
+    rewriter.eraseOp(copy);
+    if (allocation->use_empty())
+      rewriter.eraseOp(allocation);
+    return success();
+  }
+};
 } // namespace
 
 void populateScaledDotCanonicalizationPatterns(RewritePatternSet &patterns) {
-  patterns.add<EraseTiledScaledDotLoad, EraseTiledScaledDotCopy>(
-      patterns.getContext());
+  patterns.add<EraseTiledScaledDotLoad, EraseTiledScaledDotCopy,
+               EraseTiledScaledDotBulkCopy>(patterns.getContext());
 }
 
 LogicalResult

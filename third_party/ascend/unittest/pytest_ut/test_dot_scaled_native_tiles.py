@@ -53,8 +53,8 @@ def test_dot_scaled_native_large_mn(shape, a_format, b_format, with_lhs, with_rh
     m, n, k = shape
     a, ar = _operand(m, 2 * k, a_format, 1, 0)
     b, br = _operand(2 * k, n, b_format, 0, 3)
-    # Column-major B generates the indirect address tile that previously
-    # exhausted UB before native MX. The two original K blocks stay intact.
+    # Column-major B exercises indirect addresses or a full load followed by
+    # a transpose. Both must fit UB with the two original K blocks intact.
     b = b.T.contiguous().T
     ai = (torch.arange(m)[:, None] + torch.arange(2 * k // 32)[None, :]) % 4
     bi = (torch.arange(n)[:, None] * 3 + torch.arange(2 * k // 32)[None, :]) % 4
