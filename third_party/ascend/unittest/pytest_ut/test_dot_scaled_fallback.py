@@ -7,6 +7,8 @@ import torch_npu  # noqa: F401
 import triton
 import triton.language as tl
 
+from dot_scaled_test_utils import require_dot_scaled_formats
+
 
 @triton.jit
 def _scaled_fallback(a_ptr, b_ptr, sa_ptr, sb_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
@@ -74,6 +76,7 @@ def _make_scales(rows, k, scale_format):
 @pytest.mark.parametrize("scale_format", ["e8m0", "e4m3"])
 @pytest.mark.parametrize("with_a_scale,with_b_scale", [(False, False), (False, True), (True, False), (True, True)])
 def test_dot_scaled_fallback_formats(a_format, b_format, a_k_pack, b_k_pack, scale_format, with_a_scale, with_b_scale):
+    require_dot_scaled_formats(a_format, b_format, scale_format if with_a_scale or with_b_scale else None)
     m, n, k = 16, 32, 64
     a, a_ref = _make_operand((m, k), a_format, 1 if a_k_pack else 0)
     b, b_ref = _make_operand((k, n), b_format, 0 if b_k_pack else 1)
@@ -94,6 +97,7 @@ def test_dot_scaled_fallback_formats(a_format, b_format, a_k_pack, b_k_pack, sca
 
 @pytest.mark.parametrize("nan_side", ["lhs", "rhs"])
 def test_dot_scaled_fallback_nan(nan_side):
+    require_dot_scaled_formats("e2m1", "fp16", "e8m0")
     m, n, k = 16, 32, 64
     a, a_ref = _make_operand((m, k), "e2m1", 0)
     b, b_ref = _make_operand((k, n), "fp16", 0)

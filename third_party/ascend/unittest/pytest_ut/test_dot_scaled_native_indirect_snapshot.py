@@ -7,6 +7,8 @@ import torch_npu  # noqa: F401
 import triton
 import triton.language as tl
 
+from dot_scaled_test_utils import require_dot_scaled_formats
+
 
 @triton.jit
 def _native_indirect_snapshot(A, B, SA, SB, Indices, Snapshot, Output, stride_bk, stride_bn, MODE: tl.constexpr,
@@ -89,6 +91,7 @@ def _snapshot_inputs(mode, with_lhs, with_rhs):
 @pytest.mark.parametrize("with_lhs,with_rhs,explicit_acc", [(False, False, False), (True, False, True),
                                                             (False, True, False), (True, True, True)])
 def test_dot_scaled_native_indirect_snapshot(mode, with_lhs, with_rhs, explicit_acc):
+    require_dot_scaled_formats("e4m3", "e4m3")
     a, b, columns, sa, sb, selected, expected = _snapshot_inputs(mode, with_lhs, with_rhs)
     # Transfer exact FP8 storage bytes. Column-major B plus runtime indices
     # exercises the indirect-load path rather than a contiguous copy.

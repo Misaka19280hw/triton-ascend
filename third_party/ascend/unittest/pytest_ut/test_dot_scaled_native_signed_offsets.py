@@ -7,6 +7,8 @@ import torch_npu  # noqa: F401
 import triton
 import triton.language as tl
 
+from dot_scaled_test_utils import require_dot_scaled_formats
+
 
 @triton.jit
 def _native_signed_offsets(A, CenterB, SA, SB, Indices, Snapshot, Output, Bias, Correction, FORMAT: tl.constexpr,
@@ -126,6 +128,7 @@ def _signed_offset_inputs(format, mode, with_scales):
 @pytest.mark.parametrize("mode", ["negative", "wrapped", "masked", "shared", "volatile"])
 @pytest.mark.parametrize("with_scales", [False, True])
 def test_dot_scaled_native_signed_offsets(format, mode, with_scales):
+    require_dot_scaled_formats(format, format)
     a, b, columns, sa, sb, selected, expected = _signed_offset_inputs(format, mode, with_scales)
     # Keep the entire owner alive. The view's data pointer is in the middle of
     # this allocation, so every negative offset still addresses valid storage.

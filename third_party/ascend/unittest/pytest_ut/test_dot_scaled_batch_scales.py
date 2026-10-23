@@ -7,6 +7,8 @@ import torch_npu  # noqa: F401
 import triton
 import triton.language as tl
 
+from dot_scaled_test_utils import require_dot_scaled_formats
+
 
 @triton.jit
 def _batch_scaled(a_ptr, b_ptr, sa_ptr, sb_ptr, out_ptr, B: tl.constexpr, M: tl.constexpr, N: tl.constexpr,
@@ -104,11 +106,13 @@ def _run_case(shape, a_format, b_format, a_k_pack, b_k_pack, scale_format, with_
 @pytest.mark.parametrize("with_lhs,with_rhs", [(False, False), (False, True), (True, False), (True, True)])
 def test_dot_scaled_batch_scale_presence(shape, a_format, b_format, a_k_pack, b_k_pack, scale_format, with_lhs,
                                          with_rhs):
+    require_dot_scaled_formats(a_format, b_format, scale_format if with_lhs or with_rhs else None)
     _run_case(shape, a_format, b_format, a_k_pack, b_k_pack, scale_format, with_lhs, with_rhs)
 
 
 @pytest.mark.parametrize("nan_side", ["lhs", "rhs", "both"])
 def test_dot_scaled_batch_nan(nan_side):
+    require_dot_scaled_formats("e2m1", "fp16", "e8m0")
     _run_case((32, 64, 64), "e2m1", "fp16", False, True, "e8m0", True, True, nan_side)
 
 

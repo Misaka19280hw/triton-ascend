@@ -9,6 +9,8 @@ import triton.language as tl
 
 from test_dot_scaled_native_tiles_layout import _assert_layout_sensitive, _operand
 
+from dot_scaled_test_utils import require_dot_scaled_formats
+
 
 @triton.jit
 def _native_indirect_tile_dot(a_ptr, b_ptr, sa_ptr, sb_ptr, row_indices, col_indices, out_ptr, stride_bk, stride_bn,
@@ -46,6 +48,7 @@ def _native_indirect_tile_dot(a_ptr, b_ptr, sa_ptr, sb_ptr, row_indices, col_ind
 @pytest.mark.parametrize("indirect_a", [False, True])
 def test_dot_scaled_native_indirect_nonperiodic(shape, a_format, b_format, with_lhs, with_rhs, explicit_acc,
                                                 indirect_a):
+    require_dot_scaled_formats(a_format, b_format)
     m, n, k = shape
     a, ar = _operand(m, 2 * k, a_format, 1, 0)
     b, br = _operand(2 * k, n, b_format, 0, 3)

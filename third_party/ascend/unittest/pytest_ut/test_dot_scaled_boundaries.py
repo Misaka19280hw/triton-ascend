@@ -7,6 +7,8 @@ import torch_npu  # noqa: F401
 import triton
 import triton.language as tl
 
+from dot_scaled_test_utils import require_dot_scaled_formats
+
 
 @triton.jit
 def _dot_boundary(a_ptr, b_ptr, sa_ptr, sb_ptr, out_ptr, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
@@ -46,6 +48,8 @@ def _fp4_host(rows, cols, axis, phase=0):
 def test_dot_scaled_e8m0_extreme(code, other_exponent, expected, scaled_side):
     # Final values are normal and finite. In particular, scale zero is not
     # tested against a near-zero result that an absolute tolerance could hide.
+    require_dot_scaled_formats("e2m1" if scaled_side == "lhs" else "bf16", "bf16" if scaled_side == "lhs" else "e2m1",
+                               "e8m0")
     m, n, k = 16, 32, 64
     if scaled_side == "lhs":
         a = torch.full((m, k // 2), 0x22, dtype=torch.uint8)
@@ -68,6 +72,7 @@ def test_dot_scaled_e8m0_extreme(code, other_exponent, expected, scaled_side):
 @pytest.mark.parametrize("a_k_pack,b_k_pack", [(False, False), (False, True), (True, False)])
 @pytest.mark.parametrize("scale_format", ["e8m0", "e4m3"])
 def test_dot_scaled_large_packed(shape, a_k_pack, b_k_pack, scale_format):
+    require_dot_scaled_formats("e2m1", "e2m1", scale_format)
     m, n, k = shape
     a, ar = _fp4_host(m, k, 1 if a_k_pack else 0)
     b, br = _fp4_host(k, n, 0 if b_k_pack else 1, phase=3)
@@ -92,6 +97,7 @@ def test_dot_scaled_large_packed(shape, a_k_pack, b_k_pack, scale_format):
 @pytest.mark.parametrize("output_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shape", [(16, 32, 32), (64, 64, 64)])
 def test_dot_scaled_half_output(output_dtype, shape):
+    require_dot_scaled_formats("e2m1", "bf16", "e8m0")
     m, n, k = shape
     a, ar = _fp4_host(m, k, 0)
     b = ((torch.arange(k)[:, None] + 3 * torch.arange(n)[None, :]) % 8 - 3).to(torch.bfloat16) / 8
@@ -120,6 +126,7 @@ def _batch_dot_boundary(a_ptr, b_ptr, out_ptr, B: tl.constexpr, M: tl.constexpr,
 @pytest.mark.parametrize("pack_k", [False, True])
 @pytest.mark.parametrize("output_dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_dot_scaled_batch(pack_k, output_dtype):
+    require_dot_scaled_formats("e2m1", "fp16")
     batch, m, n, k = 2, 16, 32, 32
     packed, reference = zip(*[_fp4_host(m, k, 1 if pack_k else 0, phase=i * 3) for i in range(batch)])
     a = torch.stack(packed)

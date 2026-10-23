@@ -7,12 +7,15 @@ import torch_npu  # noqa: F401
 
 from test_dot_scaled_boundaries import _dot_boundary, _fp4_host
 
+from dot_scaled_test_utils import require_dot_scaled_formats
+
 
 @pytest.mark.parametrize("k", [32, 64, 128, 256])
 @pytest.mark.parametrize("with_a_scale,with_b_scale", [(False, False), (False, True), (True, False), (True, True)])
 def test_dot_scaled_native_fp4_boundary(k, with_a_scale, with_b_scale):
     # K=64 has storage K=32, the size at which the native MX decomposition
     # previously interpreted packed bytes as ordinary integer operands.
+    require_dot_scaled_formats("e2m1", "e2m1")
     m, n = 16, 32
     a, ar = _fp4_host(m, k, 1)
     b, br = _fp4_host(k, n, 0, phase=3)

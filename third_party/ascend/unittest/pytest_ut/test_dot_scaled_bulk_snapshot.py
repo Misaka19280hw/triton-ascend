@@ -7,6 +7,8 @@ import torch_npu  # noqa: F401
 import triton
 import triton.language as tl
 
+from dot_scaled_test_utils import require_dot_scaled_formats
+
 
 @triton.jit
 def _bulk_snapshot(A, B, Snapshot, C, stride_bk, stride_bn, MODE: tl.constexpr):
@@ -63,6 +65,7 @@ def _native_bulk_snapshot(A, B, Snapshot, C, stride_bk, stride_bn, MODE: tl.cons
 @pytest.mark.parametrize("layout", ["contiguous", "transpose", "strided"])
 @pytest.mark.parametrize("mode", ["plain", "alias_store", "shared", "volatile"])
 def test_dot_scaled_native_bulk_snapshot(layout, mode):
+    require_dot_scaled_formats("e4m3", "e4m3")
     a = ((torch.arange(16 * 64).reshape(16, 64) % 11 - 5) / 8).to(torch.float8_e4m3fn)
     b = ((torch.arange(64 * 64).reshape(64, 64) % 13 - 6) / 4).to(torch.float8_e4m3fn)
     expected = a.float() @ b.float()

@@ -7,6 +7,8 @@ import torch_npu  # noqa: F401
 
 from test_dot_scaled_native_tiles import _batch_native_tile_dot, _native_tile_dot
 
+from dot_scaled_test_utils import require_dot_scaled_formats
+
 
 def _operand(rows, cols, format, pack_axis, phase):
     # A 13-position pattern exposes exchanges of 16-row/column subblocks.
@@ -40,6 +42,7 @@ def _assert_layout_sensitive(product):
 @pytest.mark.parametrize("with_lhs,with_rhs", [(False, False), (False, True), (True, False), (True, True)])
 @pytest.mark.parametrize("explicit_acc", [False, True])
 def test_dot_scaled_native_large_mn_nonperiodic(shape, a_format, b_format, with_lhs, with_rhs, explicit_acc):
+    require_dot_scaled_formats(a_format, b_format)
     m, n, k = shape
     a, ar = _operand(m, 2 * k, a_format, 1, 0)
     b, br = _operand(2 * k, n, b_format, 0, 3)
@@ -73,6 +76,7 @@ def test_dot_scaled_native_large_mn_nonperiodic(shape, a_format, b_format, with_
 @pytest.mark.parametrize("with_lhs,with_rhs", [(False, False), (False, True), (True, False), (True, True)])
 @pytest.mark.parametrize("nonzero_acc", [False, True])
 def test_dot_scaled_native_batched_mn_nonperiodic(shape, format, with_lhs, with_rhs, nonzero_acc):
+    require_dot_scaled_formats(format, format)
     m, n, k = shape
     a, ar = zip(*[_operand(m, k, format, 1, batch * 3) for batch in range(2)])
     b, br = zip(*[_operand(k, n, format, 0, batch * 5 + 3) for batch in range(2)])
