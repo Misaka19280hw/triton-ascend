@@ -3475,7 +3475,7 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
 
   if (dstType.getRank() == 3) {
     // Carry each batch's accumulator through the supported 2D dot path.
-    // Dynamic CV loop pipelining requires integer, rather than index, IVs.
+    // Cast the i32 batch counter to index for the tensor slice offsets.
     Value lower = rewriter.create<arith::ConstantIntOp>(loc, 0, 32);
     Value upper =
         rewriter.create<arith::ConstantIntOp>(loc, dstType.getDimSize(0), 32);
