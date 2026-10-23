@@ -3203,7 +3203,8 @@ public:
       replacedTransposes.insert(oldTranspose);
     }
     llvm::SmallPtrSet<Operation *, 16> visited;
-    std::function<void(Value)> visit = [&](Value value) {
+    std::function<void(Value, bool)> visit = [&](Value value,
+                                                bool throughTranspose) {
       Operation *def = value ? value.getDefiningOp() : nullptr;
       if (!def || !hasOneLogicalUse(value) || !visited.insert(def).second)
         return;
@@ -3212,7 +3213,13 @@ public:
         if (rowCopy && tensor->getBlock() == dot->getBlock() &&
             canCrossToDot(rowCopy->loop))
           eligibleCopies.insert(tensor);
-        if (tileBulkLoads) {
+        // Keep untransposed operands' original snapshots. Their vector
+        // subblock partition follows the full result's M coordinate; direct
+        // CUBE loads of rebased M tiles do not preserve that partition during
+        // output assembly. Transpose paths need tiled reads to avoid both a
+        // full snapshot and its transposed buffer, and retain their existing
+        // slice/transpose ownership proof below.
+        if (tileBulkLoads && throughTranspose) {
           auto bulkCopy = matchScaledDotBulkCopy(tensor);
           if (bulkCopy && tensor->getBlock() == dot->getBlock() &&
               canCrossToDot(bulkCopy))
@@ -3227,10 +3234,10 @@ public:
       }
       if (isMemoryEffectFree(def))
         for (Value operand : def->getOperands())
-          visit(operand);
+          visit(operand, throughTranspose || isa<linalg::TransposeOp>(def));
     };
     for (Value source : sources)
-      visit(source);
+      visit(source, false);
   }
 
   Value slice(OpBuilder &builder, Value source, ArrayRef<OpFoldResult> offsets,
