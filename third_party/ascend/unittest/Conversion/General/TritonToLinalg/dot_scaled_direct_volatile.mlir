@@ -88,12 +88,19 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
 // -----
 
 // CHECK-LABEL: func.func @native_direct_plain
+// CHECK-NOT: scf.for
 // CHECK: memref.alloc() : memref<64x64xf8E4M3FN>
+// CHECK-NOT: scf.for
 // CHECK: memref.copy {{.*}} {isVolatile = false}
-// CHECK: scf.for
-// CHECK: tensor.extract_slice {{.*}} : tensor<64x64xf8E4M3FN> to tensor<64x32xf8E4M3FN>
-// CHECK-NOT: memref.alloc() : memref<64x32xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK: memref.alloc() : memref<16x64xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK: memref.copy {{.*}} {isVolatile = false}
+// CHECK-NOT: scf.for
 // CHECK: hfusion.matmul_mx
+// CHECK-SAME: : tensor<16x64xf8E4M3FN>, tensor<64x64xf8E4M3FN>, tensor<16x2xi8>, tensor<64x2xi8>) outs({{.*}} : tensor<16x64xf32>) -> tensor<16x64xf32>
+// CHECK-NOT: scf.for
+// CHECK: return
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
   tt.func public @native_direct_plain(%A: !tt.ptr<f8E4M3FN>, %B: !tt.ptr<f8E4M3FN>, %Snapshot: !tt.ptr<f8E4M3FN>, %C: !tt.ptr<f32>) attributes {noinline = false} {
     %c = arith.constant dense<0.000000e+00> : tensor<16x64xf32>
@@ -131,12 +138,19 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
 // -----
 
 // CHECK-LABEL: func.func @native_direct_volatile
+// CHECK-NOT: scf.for
 // CHECK: memref.alloc() : memref<64x64xf8E4M3FN>
+// CHECK-NOT: scf.for
 // CHECK: memref.copy {{.*}} {isVolatile = true}
-// CHECK: scf.for
-// CHECK: tensor.extract_slice {{.*}} : tensor<64x64xf8E4M3FN> to tensor<64x32xf8E4M3FN>
-// CHECK-NOT: memref.alloc() : memref<64x32xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK: memref.alloc() : memref<16x64xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK: memref.copy {{.*}} {isVolatile = false}
+// CHECK-NOT: scf.for
 // CHECK: hfusion.matmul_mx
+// CHECK-SAME: : tensor<16x64xf8E4M3FN>, tensor<64x64xf8E4M3FN>, tensor<16x2xi8>, tensor<64x2xi8>) outs({{.*}} : tensor<16x64xf32>) -> tensor<16x64xf32>
+// CHECK-NOT: scf.for
+// CHECK: return
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
   tt.func public @native_direct_volatile(%A: !tt.ptr<f8E4M3FN>, %B: !tt.ptr<f8E4M3FN>, %Snapshot: !tt.ptr<f8E4M3FN>, %C: !tt.ptr<f32>) attributes {noinline = false} {
     %c = arith.constant dense<0.000000e+00> : tensor<16x64xf32>
@@ -174,11 +188,21 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
 // -----
 
 // CHECK-LABEL: func.func @native_transpose_plain
-// CHECK-NOT: memref.alloc() : memref<64x64xf8E4M3FN>
-// CHECK: scf.for
-// CHECK: memref.alloc() : memref<32x64xf8E4M3FN>
-// CHECK: linalg.transpose {{.*}} tensor<32x64xf8E4M3FN>{{.*}}tensor<64x32xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK: memref.alloc() : memref<64x64xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK: memref.copy {{.*}} {isVolatile = false}
+// CHECK-NOT: scf.for
+// CHECK: memref.alloc() : memref<16x64xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK: memref.copy {{.*}} {isVolatile = false}
+// CHECK-NOT: scf.for
+// CHECK: linalg.transpose ins({{.*}} : tensor<64x64xf8E4M3FN>) outs({{.*}} : tensor<64x64xf8E4M3FN>)
+// CHECK-NOT: scf.for
 // CHECK: hfusion.matmul_mx
+// CHECK-SAME: : tensor<16x64xf8E4M3FN>, tensor<64x64xf8E4M3FN>, tensor<16x2xi8>, tensor<64x2xi8>) outs({{.*}} : tensor<16x64xf32>) -> tensor<16x64xf32>
+// CHECK-NOT: scf.for
+// CHECK: return
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
   tt.func public @native_transpose_plain(%A: !tt.ptr<f8E4M3FN>, %B: !tt.ptr<f8E4M3FN>, %Snapshot: !tt.ptr<f8E4M3FN>, %C: !tt.ptr<f32>) attributes {noinline = false} {
     %c = arith.constant dense<0.000000e+00> : tensor<16x64xf32>
@@ -217,14 +241,21 @@ module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
 // -----
 
 // CHECK-LABEL: func.func @native_transpose_volatile
+// CHECK-NOT: scf.for
 // CHECK: memref.alloc() : memref<64x64xf8E4M3FN>
+// CHECK-NOT: scf.for
 // CHECK: memref.copy {{.*}} {isVolatile = true}
-// CHECK: %[[FULL:.*]] = linalg.transpose ins({{.*}} : tensor<64x64xf8E4M3FN>)
-// CHECK: scf.for
-// CHECK-NOT: memref.alloc() : memref<32x64xf8E4M3FN>
-// CHECK: tensor.extract_slice %[[FULL]]{{.*}} : tensor<64x64xf8E4M3FN> to tensor<64x32xf8E4M3FN>
-// CHECK-NOT: memref.alloc() : memref<32x64xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK: memref.alloc() : memref<16x64xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK: memref.copy {{.*}} {isVolatile = false}
+// CHECK-NOT: scf.for
+// CHECK: linalg.transpose ins({{.*}} : tensor<64x64xf8E4M3FN>) outs({{.*}} : tensor<64x64xf8E4M3FN>)
+// CHECK-NOT: scf.for
 // CHECK: hfusion.matmul_mx
+// CHECK-SAME: : tensor<16x64xf8E4M3FN>, tensor<64x64xf8E4M3FN>, tensor<16x2xi8>, tensor<64x2xi8>) outs({{.*}} : tensor<16x64xf32>) -> tensor<16x64xf32>
+// CHECK-NOT: scf.for
+// CHECK: return
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
   tt.func public @native_transpose_volatile(%A: !tt.ptr<f8E4M3FN>, %B: !tt.ptr<f8E4M3FN>, %Snapshot: !tt.ptr<f8E4M3FN>, %C: !tt.ptr<f32>) attributes {noinline = false} {
     %c = arith.constant dense<0.000000e+00> : tensor<16x64xf32>

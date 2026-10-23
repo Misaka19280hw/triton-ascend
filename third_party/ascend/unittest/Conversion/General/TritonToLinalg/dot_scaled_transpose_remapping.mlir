@@ -1,15 +1,17 @@
 // RUN: triton-opt %s --split-input-file --triton-to-linalg="compile-on-910-95=true" --canonicalize | FileCheck %s
 
 // CHECK-LABEL: func.func @already_lowered_transpose
-// CHECK-NOT: memref.alloc() : memref<64x128xf8E4M3FN>
-// CHECK: scf.for
-// CHECK: memref.reinterpret_cast {{.*}} sizes: [32, 128], strides: [{{.*}}, 2]
-// CHECK: memref.alloc() : memref<32x128xf8E4M3FN>
-// CHECK: memref.copy
-// CHECK: linalg.transpose {{.*}} tensor<32x128xf8E4M3FN>{{.*}}tensor<128x32xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK: memref.alloc() : memref<64x128xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK: memref.copy {{.*}} {isVolatile = false}
+// CHECK-NOT: scf.for
+// CHECK: linalg.transpose ins({{.*}} : tensor<64x128xf8E4M3FN>) outs({{.*}} : tensor<128x64xf8E4M3FN>)
+// CHECK-NOT: scf.for
 // CHECK: hfusion.matmul_mx
-// CHECK: tensor.insert_slice
-// CHECK: return {{.*}} : tensor<16x64xf32>
+// CHECK-SAME: : tensor<16x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>, tensor<16x4xi8>, tensor<64x4xi8>) outs({{.*}} : tensor<16x64xf32>) -> tensor<16x64xf32>
+// CHECK-NOT: scf.for
+// CHECK: return
 
 func.func @already_lowered_transpose(%base: memref<?xf8E4M3FN>, %row_stride: index, %a: tensor<16x128xf8E4M3FN>, %c: tensor<16x64xf32>) -> tensor<16x64xf32> {
   %base_offset = arith.constant 5 : index
@@ -28,15 +30,17 @@ func.func @already_lowered_transpose(%base: memref<?xf8E4M3FN>, %row_stride: ind
 // -----
 
 // CHECK-LABEL: func.func @converted_transpose_single_read
-// CHECK-NOT: memref.alloc() : memref<64x128xf8E4M3FN>
-// CHECK: scf.for
-// CHECK: memref.reinterpret_cast {{.*}} sizes: [32, 128], strides: [{{.*}}, 2]
-// CHECK: memref.alloc() : memref<32x128xf8E4M3FN>
-// CHECK: memref.copy
-// CHECK: linalg.transpose {{.*}} tensor<32x128xf8E4M3FN>{{.*}}tensor<128x32xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK: memref.alloc() : memref<64x128xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK: memref.copy {{.*}} {isVolatile = false}
+// CHECK-NOT: scf.for
+// CHECK: linalg.transpose ins({{.*}} : tensor<64x128xf8E4M3FN>) outs({{.*}} : tensor<128x64xf8E4M3FN>)
+// CHECK-NOT: scf.for
 // CHECK: hfusion.matmul_mx
-// CHECK: tensor.insert_slice
-// CHECK: return {{.*}} : tensor<16x64xf32>
+// CHECK-SAME: : tensor<16x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>, tensor<16x4xi8>, tensor<64x4xi8>) outs({{.*}} : tensor<16x64xf32>) -> tensor<16x64xf32>
+// CHECK-NOT: scf.for
+// CHECK: return
 
 func.func @converted_transpose_single_read(%base: memref<?xf8E4M3FN>, %row_stride: index, %a: tensor<16x128xf8E4M3FN>, %c: tensor<16x64xf32>) -> tensor<16x64xf32> {
   %base_offset = arith.constant 5 : index
@@ -57,12 +61,20 @@ func.func @converted_transpose_single_read(%base: memref<?xf8E4M3FN>, %row_strid
 // The original tt.trans has two real dot users; it is not a pending
 // single-use conversion result even if the new transpose temporarily has none.
 // CHECK-LABEL: func.func @converted_transpose_two_dots
+// CHECK-NOT: scf.for
 // CHECK: memref.alloc() : memref<64x128xf8E4M3FN>
-// CHECK: memref.copy
-// CHECK: linalg.transpose {{.*}} tensor<64x128xf8E4M3FN>{{.*}}tensor<128x64xf8E4M3FN>
-// CHECK: scf.for
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
-// CHECK: return {{.*}} : tensor<16x64xf32>, tensor<16x64xf32>
+// CHECK-NOT: scf.for
+// CHECK: memref.copy {{.*}} {isVolatile = false}
+// CHECK-NOT: scf.for
+// CHECK: linalg.transpose ins({{.*}} : tensor<64x128xf8E4M3FN>) outs({{.*}} : tensor<128x64xf8E4M3FN>)
+// CHECK-NOT: scf.for
+// CHECK: hfusion.matmul_mx
+// CHECK-SAME: : tensor<16x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>, tensor<16x4xi8>, tensor<64x4xi8>) outs({{.*}} : tensor<16x64xf32>) -> tensor<16x64xf32>
+// CHECK-NOT: scf.for
+// CHECK: hfusion.matmul_mx
+// CHECK-SAME: : tensor<16x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>, tensor<16x4xi8>, tensor<64x4xi8>) outs({{.*}} : tensor<16x64xf32>) -> tensor<16x64xf32>
+// CHECK-NOT: scf.for
+// CHECK: return
 
 func.func @converted_transpose_two_dots(%base: memref<?xf8E4M3FN>, %row_stride: index, %a: tensor<16x128xf8E4M3FN>, %c: tensor<16x64xf32>) -> (tensor<16x64xf32>, tensor<16x64xf32>) {
   %base_offset = arith.constant 5 : index
@@ -84,12 +96,20 @@ func.func @converted_transpose_two_dots(%base: memref<?xf8E4M3FN>, %row_stride: 
 // The input also feeds a separate already-lowered transpose. Ignore only
 // the exact old/new replacement pair, not this additional logical read.
 // CHECK-LABEL: func.func @converted_transpose_shared_input
+// CHECK-NOT: scf.for
 // CHECK: memref.alloc() : memref<64x128xf8E4M3FN>
-// CHECK: memref.copy
-// CHECK: linalg.transpose {{.*}} tensor<64x128xf8E4M3FN>{{.*}}tensor<128x64xf8E4M3FN>
-// CHECK: scf.for
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
-// CHECK: return {{.*}} : tensor<16x64xf32>, tensor<16x64xf32>
+// CHECK-NOT: scf.for
+// CHECK: memref.copy {{.*}} {isVolatile = false}
+// CHECK-NOT: scf.for
+// CHECK: linalg.transpose ins({{.*}} : tensor<64x128xf8E4M3FN>) outs({{.*}} : tensor<128x64xf8E4M3FN>)
+// CHECK-NOT: scf.for
+// CHECK: hfusion.matmul_mx
+// CHECK-SAME: : tensor<16x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>, tensor<16x4xi8>, tensor<64x4xi8>) outs({{.*}} : tensor<16x64xf32>) -> tensor<16x64xf32>
+// CHECK-NOT: scf.for
+// CHECK: hfusion.matmul_mx
+// CHECK-SAME: : tensor<16x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>, tensor<16x4xi8>, tensor<64x4xi8>) outs({{.*}} : tensor<16x64xf32>) -> tensor<16x64xf32>
+// CHECK-NOT: scf.for
+// CHECK: return
 
 func.func @converted_transpose_shared_input(%base: memref<?xf8E4M3FN>, %row_stride: index, %a: tensor<16x128xf8E4M3FN>, %c: tensor<16x64xf32>) -> (tensor<16x64xf32>, tensor<16x64xf32>) {
   %base_offset = arith.constant 5 : index

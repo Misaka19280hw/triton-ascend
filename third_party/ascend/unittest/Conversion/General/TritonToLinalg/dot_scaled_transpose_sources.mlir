@@ -3,12 +3,21 @@
 // -----
 
 // CHECK-LABEL: func.func @all_sources_tileable
-// CHECK-NOT: memref.alloc() : memref<64x128xf8E4M3FN>
-// CHECK: scf.for
-// CHECK-COUNT-2: memref.alloc() : memref<32x128xf8E4M3FN>
-// CHECK: linalg.transpose
-// CHECK-SAME: tensor<32x128xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK: memref.alloc() : memref<64x128xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK: memref.copy {{.*}} {isVolatile = false}
+// CHECK-NOT: scf.for
+// CHECK: memref.alloc() : memref<64x128xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK: memref.copy {{.*}} {isVolatile = false}
+// CHECK-NOT: scf.for
+// CHECK: linalg.transpose ins({{.*}} : tensor<64x128xf8E4M3FN>) outs({{.*}} : tensor<128x64xf8E4M3FN>)
+// CHECK-NOT: scf.for
 // CHECK: hfusion.matmul_mx
+// CHECK-SAME: : tensor<16x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>, tensor<16x4xi8>, tensor<64x4xi8>) outs({{.*}} : tensor<16x64xf32>) -> tensor<16x64xf32>
+// CHECK-NOT: scf.for
+// CHECK: return
 func.func @all_sources_tileable(%base0: memref<?xf8E4M3FN>, %base1: memref<?xf8E4M3FN>, %a: tensor<16x128xf8E4M3FN>, %c: tensor<16x64xf32>) -> tensor<16x64xf32> {
   %s0 = memref.reinterpret_cast %base0 to offset: [0], sizes: [64, 128], strides: [128, 1] : memref<?xf8E4M3FN> to memref<64x128xf8E4M3FN>
   %s1 = memref.reinterpret_cast %base1 to offset: [0], sizes: [64, 128], strides: [128, 1] : memref<?xf8E4M3FN> to memref<64x128xf8E4M3FN>
@@ -28,13 +37,21 @@ func.func @all_sources_tileable(%base0: memref<?xf8E4M3FN>, %base1: memref<?xf8E
 // -----
 
 // CHECK-LABEL: func.func @mixed_snapshot_source
-// CHECK-COUNT-2: memref.alloc() : memref<64x128xf8E4M3FN>
-// CHECK: linalg.transpose
-// CHECK-SAME: tensor<64x128xf8E4M3FN>
-// CHECK: scf.for
-// CHECK-NOT: memref.alloc() : memref<32x128xf8E4M3FN>
-// CHECK: tensor.extract_slice
+// CHECK-NOT: scf.for
+// CHECK: memref.alloc() : memref<64x128xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK: memref.copy {{.*}} {isVolatile = false}
+// CHECK-NOT: scf.for
+// CHECK: memref.alloc() : memref<64x128xf8E4M3FN>
+// CHECK-NOT: scf.for
+// CHECK: memref.copy {{.*}} {isVolatile = true}
+// CHECK-NOT: scf.for
+// CHECK: linalg.transpose ins({{.*}} : tensor<64x128xf8E4M3FN>) outs({{.*}} : tensor<128x64xf8E4M3FN>)
+// CHECK-NOT: scf.for
 // CHECK: hfusion.matmul_mx
+// CHECK-SAME: : tensor<16x128xf8E4M3FN>, tensor<128x64xf8E4M3FN>, tensor<16x4xi8>, tensor<64x4xi8>) outs({{.*}} : tensor<16x64xf32>) -> tensor<16x64xf32>
+// CHECK-NOT: scf.for
+// CHECK: return
 func.func @mixed_snapshot_source(%base0: memref<?xf8E4M3FN>, %base1: memref<?xf8E4M3FN>, %a: tensor<16x128xf8E4M3FN>, %c: tensor<16x64xf32>) -> tensor<16x64xf32> {
   %s0 = memref.reinterpret_cast %base0 to offset: [0], sizes: [64, 128], strides: [128, 1] : memref<?xf8E4M3FN> to memref<64x128xf8E4M3FN>
   %s1 = memref.reinterpret_cast %base1 to offset: [0], sizes: [64, 128], strides: [128, 1] : memref<?xf8E4M3FN> to memref<64x128xf8E4M3FN>
