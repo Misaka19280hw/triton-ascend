@@ -3090,8 +3090,10 @@ static memref::CopyOp matchScaledDotBulkCopy(bufferization::ToTensorOp tensor) {
       !allocation->isBeforeInBlock(copy) || !copy->isBeforeInBlock(tensor))
     return nullptr;
   auto sourceType = dyn_cast<MemRefType>(copy.getSource().getType());
+  auto source = copy.getSource().getDefiningOp<memref::ReinterpretCastOp>();
   if (!sourceType || sourceType.getShape() != allocation.getType().getShape() ||
-      sourceType.getElementType() != allocation.getType().getElementType())
+      sourceType.getElementType() != allocation.getType().getElementType() ||
+      !source || source.getMixedOffsets().size() != 1)
     return nullptr;
   SmallVector<int64_t> strides;
   int64_t offset;
@@ -3221,9 +3223,26 @@ public:
         tensor && eligibleBulkCopies.contains(tensor)) {
       auto copy = matchScaledDotBulkCopy(tensor);
       auto loc = tensor.getLoc();
-      SmallVector<OpFoldResult> strides(sizes.size(), builder.getIndexAttr(1));
-      Value input = builder.create<memref::SubViewOp>(loc, copy.getSource(),
-                                                      offsets, sizes, strides);
+      auto source = copy.getSource().getDefiningOp<memref::ReinterpretCastOp>();
+      auto strides = source.getMixedStrides();
+      Value offset = getValueOrCreateConstantIndexOp(
+          builder, loc, source.getMixedOffsets().front());
+      for (auto [tileOffset, stride] : llvm::zip(offsets, strides)) {
+        Value index = getValueOrCreateConstantIndexOp(builder, loc, tileOffset);
+        Value step = getValueOrCreateConstantIndexOp(builder, loc, stride);
+        Value displacement = builder.create<arith::MulIOp>(loc, index, step);
+        offset = builder.create<arith::AddIOp>(loc, offset, displacement);
+      }
+      // Start tile coordinates at zero. The backend's subblock partitioning
+      // must not intersect tile-relative rows with a nonzero subview origin.
+      // Keep the original base offset and both strides in the address itself.
+      auto viewType = MemRefType::get(
+          shape, type.getElementType(),
+          StridedLayoutAttr::get(builder.getContext(), ShapedType::kDynamic,
+                                 source.getStaticStrides()),
+          source.getType().getMemorySpace());
+      Value input = builder.create<memref::ReinterpretCastOp>(
+          loc, viewType, source.getSource(), offset, sizes, strides);
       Value tile = builder.create<memref::AllocOp>(
           loc, MemRefType::get(shape, type.getElementType()));
       builder.create<memref::CopyOp>(loc, input, tile);
