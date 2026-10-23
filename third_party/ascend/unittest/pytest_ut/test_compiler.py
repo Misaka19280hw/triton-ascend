@@ -3,12 +3,16 @@ import json
 import os
 import sys
 import warnings
+from pathlib import Path
 from unittest.mock import MagicMock
+from types import SimpleNamespace
 
 import pytest
 
 import triton
 import triton.language as tl
+
+
 import triton.backends.ascend.compiler as compiler
 from triton._C.libtriton import ir
 from triton.backends.ascend import utils
@@ -150,7 +154,7 @@ def test_empty_options_expose_all_legacy_names(backend):
     assert utils._DEPRECATED_NPU_OPTIONS <= options.__dict__.keys()
     assert options.__dict__["arch"] == options.arch == backend.target.arch
     assert options.__dict__["warp_size"] == 32
-    assert options.__dict__["use_bytecode"] is True
+    assert options.__dict__["use_bytecode"] is False
     assert options.__dict__["enable_vf_fusion"] is None
 
 
@@ -195,6 +199,60 @@ def test_fp8_dot_frontend_options(backend, dtype, deprecated):
     assert ("tensor<64x64xf16>" in dot) == deprecated
 
 
+def test_text_pipeline_uses_ttadapter_directly(backend, monkeypatch):
+    options = backend.parse_options({})
+    stages = {}
+    backend.add_stages(stages, options, language=None)
+    assert list(stages) == ["ttir", "ttadapter", "npubin"]
+    assert backend.binary_extensions == {"npubin"}
+
+    def no_bridge(*args, **kwargs):
+        pytest.fail("text compatibility stage must not launch a subprocess")
+
+    monkeypatch.setattr(compiler.subprocess, "run", no_bridge)
+    text = "module { /* overridden BishengIR text */ }"
+    monkeypatch.setattr(compiler, "ttir_to_linalg", lambda *args, **kwargs: text)
+    assert stages["ttadapter"](object(), {"hash": "text-export-test"}) == text
+    consumed = []
+
+    def compile_text(src, metadata, options):
+        consumed.append(src)
+        return b"npubin"
+
+    monkeypatch.setattr(compiler, "linalg_to_bin_enable_npu_compile_910_95", compile_text)
+    monkeypatch.setattr(compiler, "linalg_to_bin_enable_npu_compile_A2_A3", compile_text)
+    monkeypatch.setattr(compiler, "rewrite_debug_line", lambda artifact, **kwargs: artifact)
+    assert stages["npubin"](text, {}) == b"npubin"
+    assert consumed == [text]
+
+
+@pytest.mark.parametrize("extension", ["mlirbc", "bcmlir"])
+def test_reject_retired_bridge_override(backend, extension):
+    with pytest.raises(ValueError, match="stages have been removed"):
+        backend.parse_options({"ir_override": f"kernel.{extension}"})
+
+
+def test_ubtuner_uses_ttadapter_without_bridge_stage(monkeypatch):
+    from triton.backends.ascend.runtime.ubtuner import UBConfig, UBTuner
+
+    text = "module { /* directly consumable ttadapter */ }"
+    compiled = SimpleNamespace(asm={"ttadapter": text})
+    tuner = object.__new__(UBTuner)
+    tuner.fn = SimpleNamespace(run=lambda *args, **kwargs: compiled)
+    monkeypatch.setattr(tuner, "_create_npu_options", lambda metadata: object())
+    monkeypatch.setattr(tuner, "_get_benefit_cost", lambda *args: {})
+    expected = UBConfig()
+    consumed = []
+
+    def try_algorithms(algorithms, benefit_cost, available_options, linalg_ir, metadata, options):
+        consumed.append(linalg_ir)
+        yield expected
+
+    monkeypatch.setattr(tuner, "_try_algorithms", try_algorithms)
+    assert tuner._find_best_config() is expected
+    assert consumed == [text]
+
+
 _IGNORED_OPTIONS = sorted(utils._DEPRECATED_NPU_OPTIONS - utils._DEPRECATED_NPU_OPTION_ROUTES.keys() -
                           utils._DEPRECATED_NPU_OPTION_ALIASES.keys() - {"stream"})
 
@@ -211,6 +269,26 @@ def test_ignored_values_preserve_defaults_and_input(backend, name):
     assert raw == original
     assert options.__dict__ == baseline.__dict__
     assert options.hash() == baseline.hash()
+
+
+@pytest.mark.parametrize("value", [None, "", "--unsupported-bisheng-option"])
+def test_legacy_bisheng_options_launch_uses_backend_defaults(backend, value):
+
+    @triton.jit
+    def kernel():
+        pass
+
+    baseline = backend.parse_options({})
+    kwargs = {"bisheng_options": value}
+
+    with pytest.warns(FutureWarning, match="bisheng_options.*backend-managed"):
+        options, signature, constexprs, attrs = kernel._pack_args(backend, kwargs, {}, [], None)
+
+    assert kwargs == {"bisheng_options": value}
+    assert options.bisheng_options == "-cce-link-aicore-ll-module " + compiler.get_libdevice()
+    assert options.__dict__ == baseline.__dict__
+    assert options.hash() == baseline.hash()
+    assert signature == constexprs == attrs == {}
 
 
 @pytest.mark.parametrize("stream", [None, 0, object()], ids=["none", "zero", "unused-object"])
@@ -294,3 +372,16 @@ def test_unknown_options_remain_available_for_jit_validation(backend):
 
     assert raw == {"unknown_compile_option": True}
     assert "unknown_compile_option" not in options.__dict__
+
+
+def test_save_temps_isolates_same_hash_compilations(monkeypatch, tmp_path):
+    monkeypatch.setattr(compiler, "get_dump_manager", lambda key: MagicMock(cache_dir=str(tmp_path)))
+    first = Path(compiler._get_save_temps_dir("same-hash"))
+    (first / "kernel.ll").write_text("first compilation")
+    second = Path(compiler._get_save_temps_dir("same-hash"))
+    (second / "kernel.ll").write_text("second compilation")
+
+    assert first != second
+    assert first.parent == second.parent == tmp_path
+    assert (first / "kernel.ll").read_text() == "first compilation"
+    assert (second / "kernel.ll").read_text() == "second compilation"
