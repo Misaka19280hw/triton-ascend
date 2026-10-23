@@ -3251,7 +3251,8 @@ public:
         call && eligibleLoads.contains(call)) {
       auto type = cast<RankedTensorType>(source.getType());
       if (type.getRank() != 2 || !type.hasStaticShape() ||
-          type.getDimSize(0) <= 1 || type.getDimSize(1) <= 0)
+          type.getDimSize(0) <= 1 || type.getDimSize(0) % 2 != 0 ||
+          type.getDimSize(1) <= 0)
         return source;
       OpBuilder::InsertionGuard guard(rewriter);
       rewriter.setInsertionPoint(call);
@@ -3259,7 +3260,10 @@ public:
       Value buffer = rewriter.create<memref::AllocOp>(
           loc, MemRefType::get(type.getShape(), type.getElementType()));
       Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-      Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+      // A one-row gather prevents the backend from assigning a legal
+      // minimum-sized subblock tile. Keep each read at least two rows,
+      // without changing the whole native product or forcing a partition.
+      Value rowStep = rewriter.create<arith::ConstantIndexOp>(loc, 2);
       Value rows =
           rewriter.create<arith::ConstantIndexOp>(loc, type.getDimSize(0));
       Value cols =
@@ -3269,13 +3273,13 @@ public:
         width /= 2;
       Value step = rewriter.create<arith::ConstantIndexOp>(loc, width);
       auto loop = rewriter.create<scf::ForOp>(
-          loc, zero, rows, one, ValueRange{},
+          loc, zero, rows, rowStep, ValueRange{},
           [&](OpBuilder &rowBuilder, Location, Value row, ValueRange) {
             rowBuilder.create<scf::ForOp>(
                 loc, zero, cols, step, ValueRange{},
                 [&](OpBuilder &builder, Location, Value col, ValueRange) {
                   SmallVector<OpFoldResult> offsets{row, col};
-                  SmallVector<OpFoldResult> sizes{builder.getIndexAttr(1),
+                  SmallVector<OpFoldResult> sizes{builder.getIndexAttr(2),
                                                   builder.getIndexAttr(width)};
                   SmallVector<OpFoldResult> strides(2, builder.getIndexAttr(1));
                   // Reuse the original integer address DAG, mask and other.
