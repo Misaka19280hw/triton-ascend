@@ -3541,6 +3541,137 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
                      dstType.getElementType().isF32() && op.getLhsKPack() &&
                      op.getRhsKPack() && hasE8M0Scale(lhsScale) &&
                      hasE8M0Scale(rhsScale);
+  // Native MX keeps its complete K reduction while bounding the M/N
+  // slices and their address tensors. Software fallback also bounds K
+  // before decoding inputs to f32. Both carry the original accumulator.
+  auto lhsTy = cast<RankedTensorType>(lhs.getType());
+  int64_t logicalK = lhsTy.getShape().back();
+  if (lhsElemType == triton::ScaleDotElemType::E2M1 && op.getLhsKPack())
+    logicalK *= 2;
+  constexpr int64_t fallbackTile = 32;
+  constexpr int64_t nativeTile = 32;
+  int64_t tileLimit = useNativeMx ? nativeTile : fallbackTile;
+  if (dstType.getRank() == 2 &&
+      (dstType.getDimSize(0) > tileLimit || dstType.getDimSize(1) > tileLimit ||
+       (!useNativeMx && logicalK > fallbackTile))) {
+    auto tileSize = [&](int64_t dim) {
+      int64_t size = std::min(dim, tileLimit);
+      while (dim % size)
+        size /= 2;
+      return size;
+    };
+    int64_t tileM = tileSize(dstType.getDimSize(0));
+    int64_t tileN = tileSize(dstType.getDimSize(1));
+    int64_t tileK = useNativeMx ? logicalK : tileSize(logicalK);
+    auto f32Type = dstType.clone(rewriter.getF32Type());
+    if (c.getType() != f32Type)
+      c = rewriter.create<arith::ExtFOp>(loc, f32Type, c);
+    Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value mEnd =
+        rewriter.create<arith::ConstantIndexOp>(loc, dstType.getDimSize(0));
+    Value nEnd =
+        rewriter.create<arith::ConstantIndexOp>(loc, dstType.getDimSize(1));
+    Value kEnd = rewriter.create<arith::ConstantIndexOp>(loc, logicalK);
+    Value mStep = rewriter.create<arith::ConstantIndexOp>(loc, tileM);
+    Value nStep = rewriter.create<arith::ConstantIndexOp>(loc, tileN);
+    Value kStep = rewriter.create<arith::ConstantIndexOp>(loc, tileK);
+    auto divideIndex = [&](OpBuilder &builder, Value index,
+                           int64_t divisor) -> Value {
+      if (divisor == 1)
+        return index;
+      Value factor = builder.create<arith::ConstantIndexOp>(loc, divisor);
+      return builder.create<arith::DivUIOp>(loc, index, factor);
+    };
+    ScaledDotLoadTiler loadTiler(op, rewriter);
+    loadTiler.prepare({lhs, rhs, lhsScale, rhsScale});
+    auto slice = [&](OpBuilder &builder, Value source, Value row, Value col,
+                     int64_t rows, int64_t cols) -> Value {
+      SmallVector<OpFoldResult> offsets{row, col};
+      SmallVector<OpFoldResult> sizes{builder.getIndexAttr(rows),
+                                      builder.getIndexAttr(cols)};
+      return loadTiler.slice(builder, source, offsets, sizes);
+    };
+    auto operandSlice = [&](OpBuilder &builder, Value operand, Value row,
+                            Value col, int64_t rows, int64_t cols, bool fp4,
+                            bool packRows) -> Value {
+      if (fp4) {
+        if (packRows) {
+          row = divideIndex(builder, row, 2);
+          rows /= 2;
+        } else {
+          col = divideIndex(builder, col, 2);
+          cols /= 2;
+        }
+      }
+      return slice(builder, operand, row, col, rows, cols);
+    };
+    auto scaleSlice = [&](OpBuilder &builder, Value scale, Value nonK, Value k,
+                          int64_t nonKSize) -> Value {
+      if (!scale)
+        return {};
+      auto type = cast<RankedTensorType>(scale.getType());
+      int64_t groupSize = logicalK / type.getShape().back();
+      return slice(builder, scale, nonK, divideIndex(builder, k, groupSize),
+                   nonKSize, tileK / groupSize);
+    };
+    // Each native M/N tile is written exactly once. Keep its original
+    // accumulator separate from the destination so bufferization need not
+    // preserve and copy a full output tensor between tile updates.
+    Value output = c;
+    if (useNativeMx)
+      output = rewriter.create<tensor::EmptyOp>(loc, f32Type.getShape(),
+                                                f32Type.getElementType());
+    auto mLoop = rewriter.create<scf::ForOp>(
+        loc, zero, mEnd, mStep, ValueRange{output},
+        [&](OpBuilder &mBuilder, Location, Value m, ValueRange mAcc) {
+          auto nLoop = mBuilder.create<scf::ForOp>(
+              loc, zero, nEnd, nStep, mAcc,
+              [&](OpBuilder &nBuilder, Location, Value n, ValueRange nAcc) {
+                Value tileAcc = slice(nBuilder, useNativeMx ? c : nAcc[0], m, n,
+                                      tileM, tileN);
+                auto kLoop = nBuilder.create<scf::ForOp>(
+                    loc, zero, kEnd, kStep, ValueRange{tileAcc},
+                    [&](OpBuilder &builder, Location, Value k,
+                        ValueRange kAcc) {
+                      Value a = operandSlice(builder, lhs, m, k, tileM, tileK,
+                                             lhsElemType ==
+                                                 triton::ScaleDotElemType::E2M1,
+                                             !op.getLhsKPack());
+                      Value b = operandSlice(builder, rhs, k, n, tileK, tileN,
+                                             rhsElemType ==
+                                                 triton::ScaleDotElemType::E2M1,
+                                             op.getRhsKPack());
+                      Value sa = scaleSlice(builder, lhsScale, m, k, tileM);
+                      Value sb = scaleSlice(builder, rhsScale, n, k, tileN);
+                      auto dot = builder.create<triton::DotScaledOp>(
+                          loc, kAcc[0].getType(), a, b, kAcc[0], sa, sb,
+                          lhsElemType, rhsElemType, op.getFastMath(),
+                          op.getLhsKPack(), op.getRhsKPack());
+                      builder.create<scf::YieldOp>(loc, dot.getResult());
+                    });
+                SmallVector<OpFoldResult> offsets{m, n};
+                SmallVector<OpFoldResult> sizes{nBuilder.getIndexAttr(tileM),
+                                                nBuilder.getIndexAttr(tileN)};
+                SmallVector<OpFoldResult> strides(2, nBuilder.getIndexAttr(1));
+                Value result = nBuilder.create<tensor::InsertSliceOp>(
+                    loc, kLoop.getResult(0), nAcc[0], offsets, sizes, strides);
+                nBuilder.create<scf::YieldOp>(loc, result);
+              });
+          mBuilder.create<scf::YieldOp>(loc, nLoop.getResults());
+        });
+    Value result = mLoop.getResult(0);
+    if (result.getType() != dstType) {
+      auto trunc = rewriter.create<arith::TruncFOp>(loc, dstType, result);
+      trunc->setAttr("round_mode",
+                     hfusion::RoundModeAttr::get(rewriter.getContext(),
+                                                 hfusion::RoundMode::RINT));
+      result = trunc;
+    }
+    rewriter.replaceOp(op, result);
+    loadTiler.markOriginalLoads();
+    return success();
+  }
+
   if (useNativeMx && !lhsScale) {
     auto lhsTy = cast<RankedTensorType>(lhs.getType());
     int64_t k = lhsTy.getShape().back();
@@ -3607,127 +3738,6 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
         /*rhsFormat(optional)*/ convertFormat(rhsElemType));
 
     rewriter.replaceOp(op, matmulMxResult);
-    return success();
-  }
-
-  // Unpack and scale bounded slices rather than expanding the entire input
-  // tile into f32. The accumulator still has the original program shape;
-  // each logical K element is visited once, carrying an FP32 accumulator.
-  auto lhsTy = cast<RankedTensorType>(lhs.getType());
-  int64_t logicalK = lhsTy.getShape().back();
-  if (lhsElemType == triton::ScaleDotElemType::E2M1 && op.getLhsKPack())
-    logicalK *= 2;
-  constexpr int64_t fallbackTile = 32;
-  if (dstType.getRank() == 2 &&
-      (dstType.getDimSize(0) > fallbackTile ||
-       dstType.getDimSize(1) > fallbackTile || logicalK > fallbackTile)) {
-    auto tileSize = [&](int64_t dim) {
-      int64_t size = std::min(dim, fallbackTile);
-      while (dim % size)
-        size /= 2;
-      return size;
-    };
-    int64_t tileM = tileSize(dstType.getDimSize(0));
-    int64_t tileN = tileSize(dstType.getDimSize(1));
-    int64_t tileK = tileSize(logicalK);
-    auto f32Type = dstType.clone(rewriter.getF32Type());
-    if (c.getType() != f32Type)
-      c = rewriter.create<arith::ExtFOp>(loc, f32Type, c);
-    Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    Value mEnd =
-        rewriter.create<arith::ConstantIndexOp>(loc, dstType.getDimSize(0));
-    Value nEnd =
-        rewriter.create<arith::ConstantIndexOp>(loc, dstType.getDimSize(1));
-    Value kEnd = rewriter.create<arith::ConstantIndexOp>(loc, logicalK);
-    Value mStep = rewriter.create<arith::ConstantIndexOp>(loc, tileM);
-    Value nStep = rewriter.create<arith::ConstantIndexOp>(loc, tileN);
-    Value kStep = rewriter.create<arith::ConstantIndexOp>(loc, tileK);
-    auto divideIndex = [&](OpBuilder &builder, Value index,
-                           int64_t divisor) -> Value {
-      if (divisor == 1)
-        return index;
-      Value factor = builder.create<arith::ConstantIndexOp>(loc, divisor);
-      return builder.create<arith::DivUIOp>(loc, index, factor);
-    };
-    ScaledDotLoadTiler loadTiler(op, rewriter);
-    loadTiler.prepare({lhs, rhs, lhsScale, rhsScale});
-    auto slice = [&](OpBuilder &builder, Value source, Value row, Value col,
-                     int64_t rows, int64_t cols) -> Value {
-      SmallVector<OpFoldResult> offsets{row, col};
-      SmallVector<OpFoldResult> sizes{builder.getIndexAttr(rows),
-                                      builder.getIndexAttr(cols)};
-      return loadTiler.slice(builder, source, offsets, sizes);
-    };
-    auto operandSlice = [&](OpBuilder &builder, Value operand, Value row,
-                            Value col, int64_t rows, int64_t cols, bool fp4,
-                            bool packRows) -> Value {
-      if (fp4) {
-        if (packRows) {
-          row = divideIndex(builder, row, 2);
-          rows /= 2;
-        } else {
-          col = divideIndex(builder, col, 2);
-          cols /= 2;
-        }
-      }
-      return slice(builder, operand, row, col, rows, cols);
-    };
-    auto scaleSlice = [&](OpBuilder &builder, Value scale, Value nonK, Value k,
-                          int64_t nonKSize) -> Value {
-      if (!scale)
-        return {};
-      auto type = cast<RankedTensorType>(scale.getType());
-      int64_t groupSize = logicalK / type.getShape().back();
-      return slice(builder, scale, nonK, divideIndex(builder, k, groupSize),
-                   nonKSize, tileK / groupSize);
-    };
-    auto mLoop = rewriter.create<scf::ForOp>(
-        loc, zero, mEnd, mStep, ValueRange{c},
-        [&](OpBuilder &mBuilder, Location, Value m, ValueRange mAcc) {
-          auto nLoop = mBuilder.create<scf::ForOp>(
-              loc, zero, nEnd, nStep, mAcc,
-              [&](OpBuilder &nBuilder, Location, Value n, ValueRange nAcc) {
-                Value tileAcc = slice(nBuilder, nAcc[0], m, n, tileM, tileN);
-                auto kLoop = nBuilder.create<scf::ForOp>(
-                    loc, zero, kEnd, kStep, ValueRange{tileAcc},
-                    [&](OpBuilder &builder, Location, Value k,
-                        ValueRange kAcc) {
-                      Value a = operandSlice(builder, lhs, m, k, tileM, tileK,
-                                             lhsElemType ==
-                                                 triton::ScaleDotElemType::E2M1,
-                                             !op.getLhsKPack());
-                      Value b = operandSlice(builder, rhs, k, n, tileK, tileN,
-                                             rhsElemType ==
-                                                 triton::ScaleDotElemType::E2M1,
-                                             op.getRhsKPack());
-                      Value sa = scaleSlice(builder, lhsScale, m, k, tileM);
-                      Value sb = scaleSlice(builder, rhsScale, n, k, tileN);
-                      auto dot = builder.create<triton::DotScaledOp>(
-                          loc, kAcc[0].getType(), a, b, kAcc[0], sa, sb,
-                          lhsElemType, rhsElemType, op.getFastMath(),
-                          op.getLhsKPack(), op.getRhsKPack());
-                      builder.create<scf::YieldOp>(loc, dot.getResult());
-                    });
-                SmallVector<OpFoldResult> offsets{m, n};
-                SmallVector<OpFoldResult> sizes{nBuilder.getIndexAttr(tileM),
-                                                nBuilder.getIndexAttr(tileN)};
-                SmallVector<OpFoldResult> strides(2, nBuilder.getIndexAttr(1));
-                Value result = nBuilder.create<tensor::InsertSliceOp>(
-                    loc, kLoop.getResult(0), nAcc[0], offsets, sizes, strides);
-                nBuilder.create<scf::YieldOp>(loc, result);
-              });
-          mBuilder.create<scf::YieldOp>(loc, nLoop.getResults());
-        });
-    Value result = mLoop.getResult(0);
-    if (result.getType() != dstType) {
-      auto trunc = rewriter.create<arith::TruncFOp>(loc, dstType, result);
-      trunc->setAttr("round_mode",
-                     hfusion::RoundModeAttr::get(rewriter.getContext(),
-                                                 hfusion::RoundMode::RINT));
-      result = trunc;
-    }
-    rewriter.replaceOp(op, result);
-    loadTiler.markOriginalLoads();
     return success();
   }
 
