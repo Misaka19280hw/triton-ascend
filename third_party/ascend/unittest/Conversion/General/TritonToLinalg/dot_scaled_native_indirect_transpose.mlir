@@ -1,25 +1,16 @@
 // RUN: triton-opt --triton-to-linalg="named-ops=True" --split-input-file %s | FileCheck %s --implicit-check-not=hivm.parallel_loop --implicit-check-not=tensor.insert_slice
 
-// An indirect snapshot below a transpose has one logical user even while
-// dialect conversion retains both the original tt.trans and its replacement.
-// True shared users must retain the complete original snapshot.
+// Original and converted transposes preserve their complete indirect snapshots.
+// Unknown i64 offsets and shared reads retain the original whole-load layout.
 
 // -----
 
 // CHECK-LABEL: func.func @native_indirect_original_transpose
 // CHECK-SAME: (%[[BASE:[^:]+]]: memref<?xf8E4M3FN>, %[[OFFSETS:[^:]+]]: tensor<64x128xi64>, %[[LHS:[^:]+]]: tensor<32x128xf8E4M3FN>, %[[C:[^:]+]]: tensor<32x64xf32>)
-// CHECK-DAG: %[[C64:[^ ]+]] = arith.constant 64 : index
-// CHECK-DAG: %[[C2:[^ ]+]] = arith.constant 2 : index
-// CHECK-DAG: %[[C0:[^ ]+]] = arith.constant 0 : index
-// CHECK: %[[SNAP:[^ ]+]] = memref.alloc() : memref<64x128xf8E4M3FN>
-// CHECK: scf.for %[[ROW:[^ ]+]] = %[[C0]] to %[[C64]] step %[[C2]] {
-// CHECK: %[[OFF_TILE:[^ ]+]] = tensor.extract_slice %[[OFFSETS]][%[[ROW]], 0] [2, 128] [1, 1] : tensor<64x128xi64> to tensor<2x128xi64>
-// CHECK: %[[READ:[^ ]+]] = {{(func\.)?}}call @triton_indirect_load{{[^ (]*}}(%[[BASE]], %[[OFF_TILE]]) {isVolatile = false}
-// CHECK-SAME: -> tensor<2x128xf8E4M3FN>
-// CHECK: %[[VIEW:[^ ]+]] = memref.subview %[[SNAP]][%[[ROW]], 0] [2, 128] [1, 1]
-// CHECK: bufferization.materialize_in_destination %[[READ]] in writable %[[VIEW]]
-// CHECK: } {ExtractedLoadOrStore}
-// CHECK: %[[WHOLE:[^ ]+]] = bufferization.to_tensor %[[SNAP]] restrict writable : memref<64x128xf8E4M3FN>
+// CHECK-NOT: memref.alloc
+// CHECK-NOT: scf.for
+// CHECK: %[[WHOLE:[^ ]+]] = {{(func\.)?}}call @triton_indirect_load{{[^ (]*}}(%[[BASE]], %[[OFFSETS]]) {isVolatile = false}
+// CHECK-SAME: (memref<?xf8E4M3FN>, tensor<64x128xi64>) -> tensor<64x128xf8E4M3FN>
 // CHECK-NOT: scf.for
 // CHECK: %[[TRANS:[^ ]+]] = linalg.transpose ins(%[[WHOLE]] : tensor<64x128xf8E4M3FN>)
 // CHECK-SAME: tensor<128x64xf8E4M3FN>) permutation = [1, 0]
@@ -42,18 +33,10 @@ func.func @native_indirect_original_transpose(%base: memref<?xf8E4M3FN>, %offset
 
 // CHECK-LABEL: func.func @native_indirect_converted_transpose
 // CHECK-SAME: (%[[BASE:[^:]+]]: memref<?xf8E4M3FN>, %[[OFFSETS:[^:]+]]: tensor<64x128xi64>, %[[LHS:[^:]+]]: tensor<32x128xf8E4M3FN>, %[[C:[^:]+]]: tensor<32x64xf32>)
-// CHECK-DAG: %[[C64:[^ ]+]] = arith.constant 64 : index
-// CHECK-DAG: %[[C2:[^ ]+]] = arith.constant 2 : index
-// CHECK-DAG: %[[C0:[^ ]+]] = arith.constant 0 : index
-// CHECK: %[[SNAP:[^ ]+]] = memref.alloc() : memref<64x128xf8E4M3FN>
-// CHECK: scf.for %[[ROW:[^ ]+]] = %[[C0]] to %[[C64]] step %[[C2]] {
-// CHECK: %[[OFF_TILE:[^ ]+]] = tensor.extract_slice %[[OFFSETS]][%[[ROW]], 0] [2, 128] [1, 1] : tensor<64x128xi64> to tensor<2x128xi64>
-// CHECK: %[[READ:[^ ]+]] = {{(func\.)?}}call @triton_indirect_load{{[^ (]*}}(%[[BASE]], %[[OFF_TILE]]) {isVolatile = false}
-// CHECK-SAME: -> tensor<2x128xf8E4M3FN>
-// CHECK: %[[VIEW:[^ ]+]] = memref.subview %[[SNAP]][%[[ROW]], 0] [2, 128] [1, 1]
-// CHECK: bufferization.materialize_in_destination %[[READ]] in writable %[[VIEW]]
-// CHECK: } {ExtractedLoadOrStore}
-// CHECK: %[[WHOLE:[^ ]+]] = bufferization.to_tensor %[[SNAP]] restrict writable : memref<64x128xf8E4M3FN>
+// CHECK-NOT: memref.alloc
+// CHECK-NOT: scf.for
+// CHECK: %[[WHOLE:[^ ]+]] = {{(func\.)?}}call @triton_indirect_load{{[^ (]*}}(%[[BASE]], %[[OFFSETS]]) {isVolatile = false}
+// CHECK-SAME: (memref<?xf8E4M3FN>, tensor<64x128xi64>) -> tensor<64x128xf8E4M3FN>
 // CHECK-NOT: scf.for
 // CHECK: %[[TRANS:[^ ]+]] = linalg.transpose ins(%[[WHOLE]] : tensor<64x128xf8E4M3FN>)
 // CHECK-SAME: tensor<128x64xf8E4M3FN>) permutation = [1, 0]

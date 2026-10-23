@@ -1,27 +1,13 @@
 // RUN: triton-opt --triton-to-linalg="named-ops=True" --split-input-file %s | FileCheck %s
 
-// Keep address arithmetic in its original integer width, including before
-// signed extension. Mask and other follow exactly the same bounded slice.
-// The complete result buffer is populated before the whole native product.
+// Preserve full-shape signed i32 address arithmetic, mask, and other.
+// Removing only its redundant sign extension retains the whole native product.
 // CHECK-LABEL: func.func @native_masked_bounded_snapshot
-// CHECK-DAG: %[[ZERO:[^ ]+]] = arith.constant 0 : index
-// CHECK-DAG: %[[TWO:[^ ]+]] = arith.constant 2 : index
-// CHECK-DAG: %[[ROWS:[^ ]+]] = arith.constant 16 : index
-// CHECK-DAG: %[[COLS:[^ ]+]] = arith.constant 512 : index
-// CHECK-DAG: %[[WIDTH:[^ ]+]] = arith.constant 256 : index
-// CHECK-NOT: arith.muli {{.*}} : tensor<16x512xi32>
-// CHECK: %[[BUFFER:[^ ]+]] = memref.alloc() : memref<16x512xf8E4M3FN>
-// CHECK: scf.for %[[ROW:[^ ]+]] = %[[ZERO]] to %[[ROWS]] step %[[TWO]]
-// CHECK: scf.for %[[COL:[^ ]+]] = %[[ZERO]] to %[[COLS]] step %[[WIDTH]]
-// CHECK: %[[PRODUCT:[^ ]+]] = arith.muli {{.*}} : tensor<2x256xi32>
-// CHECK: %[[EXT:[^ ]+]] = arith.extsi %[[PRODUCT]] : tensor<2x256xi32> to tensor<2x256xi64>
-// CHECK: %[[MASK:[^ ]+]] = tensor.extract_slice {{.*}}[%[[ROW]], %[[COL]]] [2, 256] [1, 1] : tensor<16x512xi1> to tensor<2x256xi1>
-// CHECK: %[[OTHER:[^ ]+]] = tensor.extract_slice {{.*}}[%[[ROW]], %[[COL]]] [2, 256] [1, 1] : tensor<16x512xf8E4M3FN> to tensor<2x256xf8E4M3FN>
-// CHECK: call @triton_indirect_load{{.*}}(%{{[^,]+}}, %[[EXT]], %[[MASK]], %[[OTHER]]) {{.*}} (memref<?xf8E4M3FN>, tensor<2x256xi64>, tensor<2x256xi1>, tensor<2x256xf8E4M3FN>) -> tensor<2x256xf8E4M3FN>
-// CHECK: memref.subview %[[BUFFER]][%[[ROW]], %[[COL]]] [2, 256] [1, 1]
-// CHECK: bufferization.materialize_in_destination
-// CHECK-NOT: hivm.parallel_loop
-// CHECK: bufferization.to_tensor %[[BUFFER]]
+// CHECK-NOT: scf.for
+// CHECK-NOT: memref.alloc
+// CHECK: %[[PRODUCT:[^ ]+]] = arith.muli {{.*}} : tensor<16x512xi32>
+// CHECK-NOT: arith.extsi
+// CHECK: call @triton_indirect_load{{.*}}(%{{[^,]+}}, %[[PRODUCT]], {{.*}}) {{.*}} : (memref<?xf8E4M3FN>, tensor<16x512xi32>, tensor<16x512xi1>, tensor<16x512xf8E4M3FN>) -> tensor<16x512xf8E4M3FN>
 // CHECK-NOT: scf.for
 // CHECK-NOT: tensor.insert_slice
 // CHECK: hfusion.matmul_mx
@@ -39,23 +25,16 @@ func.func @native_masked_bounded_snapshot(%base: memref<?xf8E4M3FN>, %indices: t
 
 // -----
 
-// A shared address calculation must remain available to its other consumer.
-// Cloning its bounded computation for the read must not erase the original.
+// Shared address arithmetic remains one computation used by the whole read
+// and its other consumer.
 // CHECK-LABEL: func.func @native_shared_address
-// CHECK-DAG: %[[ZERO:[^ ]+]] = arith.constant 0 : index
-// CHECK-DAG: %[[TWO:[^ ]+]] = arith.constant 2 : index
-// CHECK-DAG: %[[ROWS:[^ ]+]] = arith.constant 16 : index
-// CHECK-DAG: %[[COLS:[^ ]+]] = arith.constant 512 : index
-// CHECK-DAG: %[[WIDTH:[^ ]+]] = arith.constant 256 : index
+// CHECK-NOT: scf.for
+// CHECK-NOT: memref.alloc
 // CHECK: %[[ORIGINAL:[^ ]+]] = arith.muli {{.*}} : tensor<16x512xi32>
-// CHECK: %[[BUFFER:[^ ]+]] = memref.alloc() : memref<16x512xf8E4M3FN>
-// CHECK: scf.for %[[ROW:[^ ]+]] = %[[ZERO]] to %[[ROWS]] step %[[TWO]]
-// CHECK: scf.for %[[COL:[^ ]+]] = %[[ZERO]] to %[[COLS]] step %[[WIDTH]]
-// CHECK: arith.muli {{.*}} : tensor<2x256xi32>
-// CHECK: call @triton_indirect_load{{.*}} -> tensor<2x256xf8E4M3FN>
-// CHECK: bufferization.materialize_in_destination
-// CHECK: bufferization.to_tensor %[[BUFFER]]
-// CHECK-NOT: tensor.insert_slice
+// CHECK-NOT: arith.extsi
+// CHECK: call @triton_indirect_load{{.*}}({{.*}}, %[[ORIGINAL]]) {{.*}} : (memref<?xf8E4M3FN>, tensor<16x512xi32>) -> tensor<16x512xf8E4M3FN>
+// CHECK-NOT: arith.muli
+// CHECK-NOT: scf.for
 // CHECK: hfusion.matmul_mx
 // CHECK-SAME: tensor<16x512xf8E4M3FN>, tensor<512x32xf8E4M3FN>
 // CHECK-SAME: outs({{.*}} : tensor<16x32xf32>) -> tensor<16x32xf32>

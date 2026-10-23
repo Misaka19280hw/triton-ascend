@@ -1,27 +1,13 @@
 // RUN: triton-opt --triton-to-linalg="named-ops=True" --split-input-file %s | FileCheck %s
 
-// Keep address arithmetic in its original integer width, including before
-// signed extension. Mask and other follow exactly the same bounded slice.
-// The complete result buffer is populated before the whole native product.
+// Preserve full-shape signed i32 address arithmetic, mask, and other.
+// Removing only its redundant sign extension retains the whole native product.
 // CHECK-LABEL: func.func @native_masked_384_columns
-// CHECK-DAG: %[[ZERO:[^ ]+]] = arith.constant 0 : index
-// CHECK-DAG: %[[TWO:[^ ]+]] = arith.constant 2 : index
-// CHECK-DAG: %[[ROWS:[^ ]+]] = arith.constant 16 : index
-// CHECK-DAG: %[[COLS:[^ ]+]] = arith.constant 384 : index
-// CHECK-DAG: %[[WIDTH:[^ ]+]] = arith.constant 128 : index
-// CHECK-NOT: arith.muli {{.*}} : tensor<16x384xi32>
-// CHECK: %[[BUFFER:[^ ]+]] = memref.alloc() : memref<16x384xf8E4M3FN>
-// CHECK: scf.for %[[ROW:[^ ]+]] = %[[ZERO]] to %[[ROWS]] step %[[TWO]]
-// CHECK: scf.for %[[COL:[^ ]+]] = %[[ZERO]] to %[[COLS]] step %[[WIDTH]]
-// CHECK: %[[PRODUCT:[^ ]+]] = arith.muli {{.*}} : tensor<2x128xi32>
-// CHECK: %[[EXT:[^ ]+]] = arith.extsi %[[PRODUCT]] : tensor<2x128xi32> to tensor<2x128xi64>
-// CHECK: %[[MASK:[^ ]+]] = tensor.extract_slice {{.*}}[%[[ROW]], %[[COL]]] [2, 128] [1, 1] : tensor<16x384xi1> to tensor<2x128xi1>
-// CHECK: %[[OTHER:[^ ]+]] = tensor.extract_slice {{.*}}[%[[ROW]], %[[COL]]] [2, 128] [1, 1] : tensor<16x384xf8E4M3FN> to tensor<2x128xf8E4M3FN>
-// CHECK: call @triton_indirect_load{{.*}}(%{{[^,]+}}, %[[EXT]], %[[MASK]], %[[OTHER]]) {{.*}} (memref<?xf8E4M3FN>, tensor<2x128xi64>, tensor<2x128xi1>, tensor<2x128xf8E4M3FN>) -> tensor<2x128xf8E4M3FN>
-// CHECK: memref.subview %[[BUFFER]][%[[ROW]], %[[COL]]] [2, 128] [1, 1]
-// CHECK: bufferization.materialize_in_destination
-// CHECK-NOT: hivm.parallel_loop
-// CHECK: bufferization.to_tensor %[[BUFFER]]
+// CHECK-NOT: scf.for
+// CHECK-NOT: memref.alloc
+// CHECK: %[[PRODUCT:[^ ]+]] = arith.muli {{.*}} : tensor<16x384xi32>
+// CHECK-NOT: arith.extsi
+// CHECK: call @triton_indirect_load{{.*}}(%{{[^,]+}}, %[[PRODUCT]], {{.*}}) {{.*}} : (memref<?xf8E4M3FN>, tensor<16x384xi32>, tensor<16x384xi1>, tensor<16x384xf8E4M3FN>) -> tensor<16x384xf8E4M3FN>
 // CHECK-NOT: scf.for
 // CHECK-NOT: tensor.insert_slice
 // CHECK: hfusion.matmul_mx
@@ -40,7 +26,7 @@ func.func @native_masked_384_columns(%base: memref<?xf8E4M3FN>, %indices: tensor
 
 // -----
 
-// Preserve a legal unsliced read when an exact two-row partition is unavailable.
+// Row-one and odd-row shapes retain legal unsliced reads.
 // CHECK-LABEL: func.func @native_snapshot_rows_1
 // CHECK-NOT: scf.for
 // CHECK-NOT: memref.alloc
@@ -61,7 +47,7 @@ func.func @native_snapshot_rows_1(%base: memref<?xf8E4M3FN>, %offsets: tensor<1x
 
 // -----
 
-// Preserve a legal unsliced read when an exact two-row partition is unavailable.
+// Row-one and odd-row shapes retain legal unsliced reads.
 // CHECK-LABEL: func.func @native_snapshot_rows_3
 // CHECK-NOT: scf.for
 // CHECK-NOT: memref.alloc
