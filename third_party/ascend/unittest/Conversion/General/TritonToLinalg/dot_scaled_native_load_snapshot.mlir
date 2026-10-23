@@ -8,10 +8,10 @@
 // CHECK: %[[BUFFER:[^ ]+]] = memref.alloc() : memref<16x512xf8E4M3FN>
 // CHECK: scf.for
 // CHECK: scf.for
-// CHECK: %[[PRODUCT:[^ ]+]] = arith.muli {{.*}} : tensor<1x256xi32>
-// CHECK: %[[EXT:[^ ]+]] = arith.extsi %[[PRODUCT]] : tensor<1x256xi32> to tensor<1x256xi64>
-// CHECK: call @triton_indirect_load{{.*}}(%{{[^,]+}}, %[[EXT]], {{.*}}) {{.*}} (memref<?xf8E4M3FN>, tensor<1x256xi64>, tensor<1x256xi1>, tensor<1x256xf8E4M3FN>) -> tensor<1x256xf8E4M3FN>
-// CHECK: memref.subview %[[BUFFER]]{{.*}} [1, 256] [1, 1]
+// CHECK: %[[PRODUCT:[^ ]+]] = arith.muli {{.*}} : tensor<2x256xi32>
+// CHECK: %[[EXT:[^ ]+]] = arith.extsi %[[PRODUCT]] : tensor<2x256xi32> to tensor<2x256xi64>
+// CHECK: call @triton_indirect_load{{.*}}(%{{[^,]+}}, %[[EXT]], {{.*}}) {{.*}} (memref<?xf8E4M3FN>, tensor<2x256xi64>, tensor<2x256xi1>, tensor<2x256xf8E4M3FN>) -> tensor<2x256xf8E4M3FN>
+// CHECK: memref.subview %[[BUFFER]]{{.*}} [2, 256] [1, 1]
 // CHECK: bufferization.materialize_in_destination
 // CHECK-NOT: hivm.parallel_loop
 // CHECK: bufferization.to_tensor %[[BUFFER]]
@@ -39,8 +39,8 @@ func.func @native_masked_bounded_snapshot(%base: memref<?xf8E4M3FN>, %indices: t
 // CHECK: %[[BUFFER:[^ ]+]] = memref.alloc() : memref<16x512xf8E4M3FN>
 // CHECK: scf.for
 // CHECK: scf.for
-// CHECK: arith.muli {{.*}} : tensor<1x256xi32>
-// CHECK: call @triton_indirect_load{{.*}} -> tensor<1x256xf8E4M3FN>
+// CHECK: arith.muli {{.*}} : tensor<2x256xi32>
+// CHECK: call @triton_indirect_load{{.*}} -> tensor<2x256xf8E4M3FN>
 // CHECK: bufferization.materialize_in_destination
 // CHECK: bufferization.to_tensor %[[BUFFER]]
 // CHECK-NOT: tensor.insert_slice
