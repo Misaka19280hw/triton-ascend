@@ -3340,6 +3340,18 @@ private:
       return isNonvolatileIndirectLoad(call);
     if (isa<memref::AllocOp, bufferization::ToTensorOp>(operation))
       return true;
+    // An op can expose both its own effects and recursive region effects.
+    // For example, a linalg.generic writing a private output may also write
+    // an alias of the load source from inside its region.
+    bool recursive = operation->hasTrait<OpTrait::HasRecursiveMemoryEffects>();
+    if (operation->getNumRegions() && !recursive)
+      return false;
+    if (recursive)
+      for (Region &region : operation->getRegions())
+        for (Block &block : region)
+          for (Operation &nested : block)
+            if (!canCross(&nested, load))
+              return false;
     if (auto effects = dyn_cast<MemoryEffectOpInterface>(operation)) {
       SmallVector<MemoryEffects::EffectInstance> instances;
       effects.getEffects(instances);
@@ -3350,15 +3362,7 @@ private:
                 isFreshPrivateBuffer(effect.getValue(), load));
       });
     }
-    if (operation->hasTrait<OpTrait::HasRecursiveMemoryEffects>()) {
-      for (Region &region : operation->getRegions())
-        for (Block &block : region)
-          for (Operation &nested : block)
-            if (!canCross(&nested, load))
-              return false;
-      return true;
-    }
-    return isMemoryEffectFree(operation);
+    return recursive || isMemoryEffectFree(operation);
   }
 
   bool canTileLoad(func::CallOp call) const {
