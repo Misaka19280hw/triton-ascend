@@ -22,7 +22,10 @@ def _convert_fnuz(arg, dst_ty, rounding, semantic):
     dst = dst_ty.scalar
     if _is_fnuz(src):
         mantissa, bias = (3, 8) if src.is_fp8e4b8() else (2, 16)
-        bits = semantic.cast(semantic.bitcast(arg, core.uint8), core.uint32)
+        # Fraction and exponent are nonnegative and fit in signed i32;
+        # the sign is only a bit mask. Signed field arithmetic avoids
+        # unsupported unsigned casts on A3.
+        bits = semantic.cast(semantic.bitcast(arg, core.uint8), core.int32)
         fraction = semantic.and_(bits, (1 << mantissa) - 1)
         exponent = semantic.lshr(semantic.and_(bits, 0x7f), mantissa)
         sign = semantic.shl(semantic.and_(bits, 0x80), 24)
@@ -32,7 +35,7 @@ def _convert_fnuz(arg, dst_ty, rounding, semantic):
                          semantic.shl(fraction, 23 - mantissa)))
         # Subnormal magnitudes are small exact powers-of-two multiples.
         small = semantic.mul(semantic.cast(fraction, core.float32), 2.0**(1 - bias - mantissa), sanitize_overflow=False)
-        small_bits = semantic.or_(semantic.bitcast(small, core.uint32), sign)
+        small_bits = semantic.or_(semantic.bitcast(small, core.int32), sign)
         decoded = semantic.where(semantic.equal(exponent, 0), small_bits, normal)
         decoded = semantic.where(semantic.equal(bits, 0x80), 0x7fc00000, decoded)
         return semantic.cast(semantic.bitcast(decoded, core.float32), dst_ty)
@@ -44,8 +47,12 @@ def _convert_fnuz(arg, dst_ty, rounding, semantic):
         raise ValueError("Ascend software FNUZ conversion supports up to float32 inputs")
     arg = semantic.cast(arg, core.float32)
     mantissa, bias = (3, 8) if dst.is_fp8e4b8() else (2, 16)
-    bits = semantic.bitcast(arg, core.uint32)
+    bits = semantic.bitcast(arg, core.int32)
     magnitude = semantic.and_(bits, 0x7fffffff)
+    invalid_input = semantic.greater_equal(magnitude, 0x7f800000)
+    # NaN payloads are irrelevant to FNUZ's unique NaN. Bound them before
+    # rounding so even the unselected arithmetic stays within signed i32.
+    magnitude = semantic.minimum(magnitude, 0x7f800000, core.PropagateNan.NONE)
     sign = semantic.and_(semantic.lshr(bits, 24), 0x80)
     exponent = semantic.lshr(magnitude, 23)
     shift = 23 - mantissa
@@ -74,7 +81,7 @@ def _convert_fnuz(arg, dst_ty, rounding, semantic):
         encoded = semantic.minimum(encoded, 0x7f, core.PropagateNan.NONE)
     # Both signs of a value rounding to zero become the single positive zero.
     signed = semantic.where(semantic.equal(encoded, 0), 0, semantic.or_(encoded, sign))
-    invalid = semantic.or_(semantic.greater_equal(magnitude, 0x7f800000), semantic.greater_equal(encoded, 0x80))
+    invalid = semantic.or_(invalid_input, semantic.greater_equal(encoded, 0x80))
     signed = semantic.where(invalid, 0x80, signed)
     return semantic.bitcast(semantic.cast(signed, core.uint8), dst_ty)
 
@@ -111,16 +118,23 @@ def convert_custom_float8(arg, dst_ty, fp_downcast_rounding=None, _semantic=None
 
     if dst_scalar.is_fp8e4b15() and src_scalar.is_bf16():
         # Widen the representation without canonicalizing a signed NaN.
-        bits = _semantic.cast(_semantic.bitcast(arg, core.uint16), core.uint32)
+        bits = _semantic.cast(_semantic.bitcast(arg, core.int16), core.int32)
         arg = _semantic.bitcast(_semantic.shl(bits, 16), core.float32)
         src_scalar = arg.type.scalar
 
     if dst_scalar.is_fp8e4b15() and src_scalar.is_int():
-        # tl.load(..., other=0) casts its integer padding value to the loaded
-        # dtype. Integers 0 and +/-1 are exact, and every
-        # other integer is outside the encoder's +/-1.75 saturation range.
-        arg = _semantic.cast(arg, core.float32)
-        src_scalar = arg.type.scalar
+        # Only 0 and +/-1 lie within the encoder's saturation range. Encode
+        # them directly: converting a wider integer to float is unnecessary
+        # and can be unsupported or lose its sign on A3.
+        one = _semantic.equal(arg, 1)
+        signed = src_scalar.is_int_signed() and not src_scalar.is_bool()
+        if signed:
+            one = _semantic.or_(one, _semantic.equal(arg, -1))
+        encoded = _semantic.where(one, 0x78, 0x7e)
+        encoded = _semantic.where(_semantic.equal(arg, 0), 0, encoded)
+        if signed:
+            encoded = _semantic.or_(encoded, _semantic.where(_semantic.less_than(arg, 0), 0x80, 0))
+        return _semantic.bitcast(_semantic.cast(encoded, core.uint8), dst_ty)
 
     if not dst_scalar.is_fp8e4b15() or not (src_scalar.is_fp16() or src_scalar.is_fp32()):
         raise ValueError("Ascend fp8e4b15 encoding supports integer, float16, bfloat16 and float32 inputs; "
@@ -140,7 +154,7 @@ def convert_custom_float8(arg, dst_ty, fp_downcast_rounding=None, _semantic=None
         # Direct rounding is therefore equivalent to the upstream FP32 ->
         # FP16 RTZ -> FP8 ties-away sequence. Integer operations also avoid
         # a tensor-only HFusion cast when the argument is a scalar.
-        bits = _semantic.bitcast(arg, core.uint32)
+        bits = _semantic.bitcast(arg, core.int32)
         sign = _semantic.and_(_semantic.lshr(bits, 24), 0x80)
         magnitude = _semantic.and_(bits, 0x7fffffff)
         magnitude = _semantic.minimum(magnitude, 0x3fe00000, core.PropagateNan.NONE)
