@@ -1004,6 +1004,8 @@ def convert_sigtype_to_int(sigty: str):
         # Software E4M3B15 has no CANN profiling dtype. Report UNDEFINED
         # rather than a different FP8 encoding; this does not affect its ABI.
         "fp8e4b15": -1,
+        "fp8e4b8": -1,
+        "fp8e5b16": -1,
     }
     if sigty not in MAP_SIGTYPE_TO_INT:
         raise ValueError(f"Unsupported data type: {sigty}")

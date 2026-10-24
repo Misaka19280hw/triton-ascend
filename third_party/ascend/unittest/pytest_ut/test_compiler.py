@@ -198,7 +198,7 @@ def test_fp8_dot_frontend_options(backend, dtype, deprecated):
 
     assert module.verify()
     dot = next(line for line in str(module).splitlines() if "tt.dot " in line)
-    assert ("tensor<64x64xf16>" in dot) == (deprecated or dtype == tl.float8e4b15)
+    assert ("tensor<64x64xf16>" in dot) == (deprecated or dtype in (tl.float8e4b15, tl.float8e4b8, tl.float8e5b16))
 
 
 def test_text_pipeline_uses_ttadapter_directly(backend, monkeypatch):
