@@ -15,11 +15,13 @@ from dot_scaled_test_utils import require_dot_scaled_formats
 @triton.jit
 def _native_indirect_tile_dot(a_ptr, b_ptr, sa_ptr, sb_ptr, row_indices, col_indices, out_ptr, stride_bk, stride_bn,
                               M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, A_FORMAT: tl.constexpr,
-                              B_FORMAT: tl.constexpr, EXPLICIT_ACC: tl.constexpr, INDIRECT_A: tl.constexpr):
+                              B_FORMAT: tl.constexpr, EXPLICIT_ACC: tl.constexpr, INDIRECT_A: tl.constexpr,
+                              BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+    tl.static_assert(M % BLOCK_M == 0 and N % BLOCK_N == 0)
     AK: tl.constexpr = K // 2 if A_FORMAT == "e2m1" else K
     BK: tl.constexpr = K // 2 if B_FORMAT == "e2m1" else K
-    rows = tl.arange(0, M)
-    cols = tl.arange(0, N)
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     a_rows = tl.load(row_indices + rows) if INDIRECT_A else rows
     b_cols = cols if INDIRECT_A else tl.load(col_indices + cols)
     acc = .125 + rows[:, None].to(tl.float32) / 128 + cols[None, :].to(tl.float32) / 64
@@ -76,8 +78,11 @@ def test_dot_scaled_native_indirect_nonperiodic(shape, a_format, b_format, with_
         product += partial
     _assert_layout_sensitive(product)
     actual = torch.empty((m, n), dtype=torch.float32, device="npu")
-    _native_indirect_tile_dot[(1, )](a.to("npu"), b.to("npu"), sa.to("npu") if with_lhs else None,
-                                     sb.to("npu") if with_rhs else None, rows.to(torch.int32).to("npu"),
-                                     cols.to(torch.int32).to("npu"), actual, *b.stride(), m, n, k, a_format, b_format,
-                                     explicit_acc, indirect_a)
+    # Bound per-program storage without reducing the matrix or splitting either K block.
+    block_m, block_n = 32, 32
+    grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n))
+    _native_indirect_tile_dot[grid](a.to("npu"), b.to("npu"), sa.to("npu") if with_lhs else None,
+                                    sb.to("npu") if with_rhs else None, rows.to(torch.int32).to("npu"),
+                                    cols.to(torch.int32).to("npu"), actual, *b.stride(), m, n, k, a_format, b_format,
+                                    explicit_acc, indirect_a, block_m, block_n)
     torch.testing.assert_close(actual.cpu(), expected, atol=0, rtol=0)
