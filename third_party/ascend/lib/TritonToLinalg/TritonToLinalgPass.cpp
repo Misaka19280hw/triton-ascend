@@ -1912,6 +1912,7 @@ LogicalResult TritonToLinalgPass::finalizeLoweredModule(ModuleOp moduleOp,
     RewritePatternSet foldPatterns(&getContext());
     TTOpConverters::populatePostConversionCanonicalizationPatterns(
         foldPatterns);
+    TTOpConverters::populateScaledDotCanonicalizationPatterns(foldPatterns);
 
     if (failed(applyPatternsGreedily(moduleOp, std::move(foldPatterns)))) {
       moduleOp->emitError("failed to fold one-hot gather after max_with_index");

@@ -785,6 +785,8 @@ struct SortOpConverter : public OpConversionPattern<triton::ascend::SortOp> {
                   ConversionPatternRewriter &rewriter) const override;
 };
 
+void populateScaledDotCanonicalizationPatterns(RewritePatternSet &patterns);
+
 struct DotScaledConverter : public OpConversionPattern<triton::DotScaledOp> {
   DotScaledConverter(MLIRContext *context, bool compileOn91095)
       : OpConversionPattern(context), compileOn91095(compileOn91095) {}

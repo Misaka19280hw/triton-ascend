@@ -42,6 +42,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <cstdlib>
+#include <functional>
 #include <utility>
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -53,10 +54,12 @@
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/ValueRange.h"
 #include "mlir/Interfaces/CallInterfaces.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HFusion/IR/HFusion.h"
@@ -3057,6 +3060,472 @@ SortOpConverter::matchAndRewrite(triton::ascend::SortOp op, OpAdaptor adaptor,
   return success();
 }
 
+namespace {
+static bool isNonvolatileScaledDotCopy(memref::CopyOp copy) {
+  auto volatility = copy->getAttrOfType<BoolAttr>("isVolatile");
+  return volatility && !volatility.getValue();
+}
+
+struct ScaledDotRowCopy {
+  memref::AllocOp allocation;
+  scf::ForOp loop;
+  memref::CopyOp copy;
+  memref::ReinterpretCastOp source;
+  memref::SubViewOp destination;
+};
+
+// Only recognize the exact unmasked row-copy load emitted by memory lowering.
+// No padding, partial rows, additional users, or observable writes may hide in
+// the copy loop; everything other than its copy must be a pure scalar address.
+static std::optional<ScaledDotRowCopy>
+matchScaledDotRowCopy(bufferization::ToTensorOp tensor) {
+  auto allocation = tensor.getBuffer().getDefiningOp<memref::AllocOp>();
+  if (!allocation || allocation.getType().getRank() != 2 ||
+      !allocation.getType().hasStaticShape() ||
+      !allocation.getType().getLayout().isIdentity() ||
+      allocation.getType().getMemorySpace())
+    return std::nullopt;
+  memref::SubViewOp destination;
+  for (Operation *user : allocation->getUsers()) {
+    if (user == tensor)
+      continue;
+    if (destination || !(destination = dyn_cast<memref::SubViewOp>(user)))
+      return std::nullopt;
+  }
+  if (!destination || !destination->hasOneUse())
+    return std::nullopt;
+  auto copy = dyn_cast<memref::CopyOp>(*destination->getUsers().begin());
+  auto loop = destination->getParentOfType<scf::ForOp>();
+  if (!copy || !isNonvolatileScaledDotCopy(copy) || !loop ||
+      copy.getTarget() != destination.getResult() ||
+      loop->getBlock() != tensor->getBlock() ||
+      !loop->hasAttr("ExtractedLoadOrStore") ||
+      loop.getNumRegionIterArgs() != 0 ||
+      getConstantIntValue(loop.getLowerBound()) != 0 ||
+      getConstantIntValue(loop.getStep()) != 1 ||
+      getConstantIntValue(loop.getUpperBound()) !=
+          allocation.getType().getDimSize(0))
+    return std::nullopt;
+  int64_t cols = allocation.getType().getDimSize(1);
+  if (destination.getMixedOffsets().size() != 2 ||
+      dyn_cast<Value>(destination.getMixedOffsets()[0]) !=
+          loop.getInductionVar() ||
+      getConstantIntValue(destination.getMixedOffsets()[1]) != 0 ||
+      destination.getStaticSizes() != ArrayRef<int64_t>({1, cols}) ||
+      destination.getStaticStrides() != ArrayRef<int64_t>({1, 1}))
+    return std::nullopt;
+  auto source = copy.getSource().getDefiningOp<memref::ReinterpretCastOp>();
+  if (!source || !source->hasOneUse() ||
+      source.getStaticSizes() != ArrayRef<int64_t>({1, cols}) ||
+      source.getStaticStrides() != ArrayRef<int64_t>({cols, 1}) ||
+      source.getMixedOffsets().size() != 1 ||
+      source.getSource().getParentBlock() == loop.getBody())
+    return std::nullopt;
+  auto baseType = dyn_cast<MemRefType>(source.getSource().getType());
+  if (!baseType || baseType.getRank() != 1 ||
+      !baseType.getLayout().isIdentity() || baseType.getMemorySpace())
+    return std::nullopt;
+  for (Operation &nested : loop.getBody()->without_terminator()) {
+    if (&nested == copy || &nested == source || &nested == destination)
+      continue;
+    if (nested.getNumRegions() != 0 || !isMemoryEffectFree(&nested) ||
+        llvm::any_of(nested.getResultTypes(),
+                     [](Type type) { return !type.isIntOrIndex(); }))
+      return std::nullopt;
+  }
+  return ScaledDotRowCopy{allocation, loop, copy, source, destination};
+}
+
+// HFusion accepts signed i32 indirect offsets. Recover that representation
+// only when the entire original i64 offset is a sign extension of i32; all
+// arithmetic (including i32 overflow), masks and read ordering stay unchanged.
+static void narrowNativeScaledDotOffsets(ArrayRef<Value> roots,
+                                         ConversionPatternRewriter &rewriter) {
+  llvm::SmallPtrSet<Operation *, 16> visited;
+  std::function<void(Value)> visit = [&](Value value) {
+    Operation *def = value ? value.getDefiningOp() : nullptr;
+    if (!def || !visited.insert(def).second)
+      return;
+    if (auto call = dyn_cast<func::CallOp>(def)) {
+      if (!call.getCallee().starts_with("triton_indirect_load") ||
+          call.getNumOperands() < 2 || call.getNumResults() != 1)
+        return;
+      auto function = SymbolTable::lookupNearestSymbolFrom<func::FuncOp>(
+          call, call.getCalleeAttr());
+      if (!function || !function.isPrivate() || !function.isExternal() ||
+          function.getFunctionType() !=
+              rewriter.getFunctionType(call.getOperandTypes(),
+                                       call.getResultTypes()))
+        return;
+      auto extend = call.getOperand(1).getDefiningOp<arith::ExtSIOp>();
+      if (!extend)
+        return;
+      auto inputType = dyn_cast<RankedTensorType>(extend.getIn().getType());
+      auto offsetType = dyn_cast<RankedTensorType>(extend.getType());
+      if (!inputType || !offsetType ||
+          !inputType.getElementType().isInteger(32) ||
+          !offsetType.getElementType().isInteger(64) ||
+          inputType.getShape() != offsetType.getShape())
+        return;
+      SmallVector<Value> operands(call.getOperands());
+      operands[1] = extend.getIn();
+      auto module = call->getParentOfType<ModuleOp>();
+      auto name = generateUniqueFuncName(module, "triton_indirect_load");
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToEnd(module.getBody());
+      auto narrowedFunction = rewriter.create<func::FuncOp>(
+          call.getLoc(), name.str(),
+          rewriter.getFunctionType(TypeRange(ValueRange(operands)),
+                                   call.getResultTypes()));
+      for (NamedAttribute attr : function->getAttrs())
+        if (attr.getName() != "sym_name" && attr.getName() != "function_type")
+          narrowedFunction->setAttr(attr.getName(), attr.getValue());
+      rewriter.setInsertionPoint(call);
+      auto narrowed = rewriter.create<func::CallOp>(
+          call.getLoc(), narrowedFunction.getSymNameAttr(),
+          call.getResultTypes(), operands);
+      for (NamedAttribute attr : call->getAttrs())
+        if (attr.getName() != "callee")
+          narrowed->setAttr(attr.getName(), attr.getValue());
+      rewriter.replaceOp(call, narrowed.getResults());
+      return;
+    }
+    if (isMemoryEffectFree(def))
+      for (Value operand : def->getOperands())
+        visit(operand);
+  };
+  for (Value root : roots)
+    visit(root);
+}
+
+// Tile only nonvolatile indirect reads whose original snapshot can be moved
+// to the dot. In particular, a store between the load and dot must not change
+// the value observed by the dot, even when the load has only one user.
+class ScaledDotLoadTiler {
+public:
+  ScaledDotLoadTiler(triton::DotScaledOp dot,
+                     ConversionPatternRewriter &rewriter)
+      : dot(dot), rewriter(rewriter) {}
+
+  void prepare(ArrayRef<Value> sources) {
+    llvm::SmallPtrSet<Operation *, 16> visited;
+    std::function<void(Value)> visit = [&](Value value) {
+      Operation *def = value ? value.getDefiningOp() : nullptr;
+      if (!def || !value.hasOneUse() || !visited.insert(def).second)
+        return;
+      if (auto tensor = dyn_cast<bufferization::ToTensorOp>(def)) {
+        auto rowCopy = matchScaledDotRowCopy(tensor);
+        if (rowCopy && tensor->getBlock() == dot->getBlock() &&
+            canCrossToDot(rowCopy->loop))
+          eligibleCopies.insert(tensor);
+        return;
+      }
+      if (auto call = dyn_cast<func::CallOp>(def)) {
+        if (canTileLoad(call))
+          eligibleLoads.insert(call);
+        return;
+      }
+      if (isMemoryEffectFree(def))
+        for (Value operand : def->getOperands())
+          visit(operand);
+    };
+    for (Value source : sources)
+      visit(source);
+  }
+
+  Value slice(OpBuilder &builder, Value source, ArrayRef<OpFoldResult> offsets,
+              ArrayRef<OpFoldResult> sizes) {
+    auto type = cast<RankedTensorType>(source.getType());
+    SmallVector<int64_t> shape;
+    for (OpFoldResult size : sizes)
+      shape.push_back(cast<IntegerAttr>(cast<Attribute>(size)).getInt());
+    auto resultType = type.clone(shape);
+    Operation *def = source.getDefiningOp();
+    if (auto tensor = dyn_cast_or_null<bufferization::ToTensorOp>(def);
+        tensor && eligibleCopies.contains(tensor)) {
+      auto rowCopy = *matchScaledDotRowCopy(tensor);
+      auto loc = tensor.getLoc();
+      Value tile = builder.create<memref::AllocOp>(
+          loc, MemRefType::get(shape, type.getElementType()));
+      Value zero = builder.create<arith::ConstantIndexOp>(loc, 0);
+      Value one = builder.create<arith::ConstantIndexOp>(loc, 1);
+      Value rows = builder.create<arith::ConstantIndexOp>(loc, shape[0]);
+      Value rowOffset =
+          getValueOrCreateConstantIndexOp(builder, loc, offsets[0]);
+      Value colOffset =
+          getValueOrCreateConstantIndexOp(builder, loc, offsets[1]);
+      auto loop = builder.create<scf::ForOp>(
+          loc, zero, rows, one, ValueRange{},
+          [&](OpBuilder &nested, Location, Value row, ValueRange) {
+            IRMapping mapping;
+            Value originalRow =
+                nested.create<arith::AddIOp>(loc, row, rowOffset);
+            mapping.map(rowCopy.loop.getInductionVar(), originalRow);
+            for (Operation &operation :
+                 rowCopy.loop.getBody()->without_terminator()) {
+              if (&operation == rowCopy.copy || &operation == rowCopy.source ||
+                  &operation == rowCopy.destination)
+                continue;
+              nested.clone(operation, mapping);
+            }
+            OpFoldResult originalOffset = rowCopy.source.getMixedOffsets()[0];
+            if (auto value = dyn_cast<Value>(originalOffset))
+              originalOffset = mapping.lookupOrDefault(value);
+            Value offset =
+                getValueOrCreateConstantIndexOp(nested, loc, originalOffset);
+            offset = nested.create<arith::AddIOp>(loc, offset, colOffset);
+            SmallVector<OpFoldResult> copySizes{nested.getIndexAttr(1),
+                                                nested.getIndexAttr(shape[1])};
+            SmallVector<OpFoldResult> sourceStrides{
+                nested.getIndexAttr(shape[1]), nested.getIndexAttr(1)};
+            auto viewType = MemRefType::get(
+                {1, shape[1]}, type.getElementType(),
+                StridedLayoutAttr::get(nested.getContext(),
+                                       ShapedType::kDynamic, {shape[1], 1}));
+            Value input = nested.create<memref::ReinterpretCastOp>(
+                loc, viewType, rowCopy.source.getSource(), offset, copySizes,
+                sourceStrides);
+            SmallVector<OpFoldResult> destinationOffsets{
+                row, nested.getIndexAttr(0)};
+            SmallVector<OpFoldResult> strides(2, nested.getIndexAttr(1));
+            Value output = nested.create<memref::SubViewOp>(
+                loc, tile, destinationOffsets, copySizes, strides);
+            nested.create<memref::CopyOp>(loc, input, output);
+            nested.create<scf::YieldOp>(loc);
+          });
+      loop->setAttrs(rowCopy.loop->getAttrs());
+      replacedCopies.insert(tensor);
+      return builder.create<bufferization::ToTensorOp>(
+          loc, resultType, tile, /*restrict=*/true, /*writable=*/true);
+    }
+    if (auto call = dyn_cast_or_null<func::CallOp>(def);
+        call && eligibleLoads.contains(call)) {
+      SmallVector<Value> operands{call.getOperand(0)};
+      for (Value operand : call.getOperands().drop_front())
+        operands.push_back(slice(builder, operand, offsets, sizes));
+      auto module = dot->getParentOfType<ModuleOp>();
+      auto functionType = builder.getFunctionType(
+          TypeRange(ValueRange(operands)), TypeRange{resultType});
+      auto name = generateUniqueFuncName(module, "triton_indirect_load");
+      func::FuncOp function;
+      {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToEnd(module.getBody());
+        function = rewriter.create<func::FuncOp>(call.getLoc(), name.str(),
+                                                 functionType);
+        function.setPrivate();
+        function->setAttr("isVolatile", builder.getBoolAttr(false));
+      }
+      auto tiled =
+          builder.create<func::CallOp>(call.getLoc(), function.getSymNameAttr(),
+                                       TypeRange{resultType}, operands);
+      tiled->setAttr("isVolatile", builder.getBoolAttr(false));
+      replacedLoads.insert(call);
+      return tiled.getResult(0);
+    }
+    if (def && def->getNumResults() == 1 && def->getNumRegions() == 0 &&
+        def->hasTrait<OpTrait::Elementwise>() && isMemoryEffectFree(def)) {
+      IRMapping mapping;
+      for (Value operand : def->getOperands()) {
+        auto operandType = dyn_cast<RankedTensorType>(operand.getType());
+        if (!operandType)
+          continue;
+        if (operandType.getShape() != type.getShape())
+          return extract(builder, source, offsets, sizes);
+        mapping.map(operand, slice(builder, operand, offsets, sizes));
+      }
+      Operation *tiled = builder.clone(*def, mapping);
+      tiled->getResult(0).setType(resultType);
+      return tiled->getResult(0);
+    }
+    if (auto broadcast = dyn_cast_or_null<triton::BroadcastOp>(def)) {
+      auto inputType = cast<RankedTensorType>(broadcast.getSrc().getType());
+      SmallVector<OpFoldResult> inputOffsets(offsets), inputSizes(sizes);
+      for (int64_t dim = 0; dim < type.getRank(); ++dim) {
+        if (inputType.getDimSize(dim) == 1) {
+          inputOffsets[dim] = builder.getIndexAttr(0);
+          inputSizes[dim] = builder.getIndexAttr(1);
+        }
+      }
+      return builder.create<triton::BroadcastOp>(
+          def->getLoc(), resultType,
+          slice(builder, broadcast.getSrc(), inputOffsets, inputSizes));
+    }
+    if (auto expand = dyn_cast_or_null<triton::ExpandDimsOp>(def)) {
+      SmallVector<OpFoldResult> inputOffsets(offsets), inputSizes(sizes);
+      inputOffsets.erase(inputOffsets.begin() + expand.getAxis());
+      inputSizes.erase(inputSizes.begin() + expand.getAxis());
+      return builder.create<triton::ExpandDimsOp>(
+          def->getLoc(), resultType,
+          slice(builder, expand.getSrc(), inputOffsets, inputSizes),
+          expand.getAxis());
+    }
+    if (auto splat = dyn_cast_or_null<triton::SplatOp>(def))
+      return builder.create<triton::SplatOp>(def->getLoc(), resultType,
+                                             splat.getSrc());
+    return extract(builder, source, offsets, sizes);
+  }
+
+  void markOriginalLoads() {
+    // Conversion rewriting defers the old dot's erasure. A post-conversion
+    // pattern removes a marked call only after all its users are gone.
+    for (Operation *load : replacedLoads)
+      load->setAttr("tt.scaled_dot_tiled", rewriter.getUnitAttr());
+    for (Operation *tensor : replacedCopies) {
+      auto rowCopy =
+          matchScaledDotRowCopy(cast<bufferization::ToTensorOp>(tensor));
+      rowCopy->loop->setAttr("tt.scaled_dot_tiled", rewriter.getUnitAttr());
+    }
+  }
+
+private:
+  static bool isNonvolatileIndirectLoad(func::CallOp call) {
+    auto volatility = call->getAttrOfType<BoolAttr>("isVolatile");
+    return call.getCallee().starts_with("triton_indirect_load") && volatility &&
+           !volatility.getValue();
+  }
+
+  // A fresh allocation made after the original load cannot alias its source.
+  bool isFreshPrivateBuffer(Value value, Operation *load) const {
+    while (Operation *def = value.getDefiningOp()) {
+      if (auto view = dyn_cast<ViewLikeOpInterface>(def)) {
+        value = view.getViewSource();
+        continue;
+      }
+      if (isa<memref::CastOp>(def)) {
+        value = def->getOperand(0);
+        continue;
+      }
+      auto alloc = dyn_cast<memref::AllocOp>(def);
+      return alloc && alloc->getBlock() == load->getBlock() &&
+             load->isBeforeInBlock(alloc) && alloc->isBeforeInBlock(dot);
+    }
+    return false;
+  }
+
+  bool canCross(Operation *operation, Operation *load) const {
+    if (auto call = dyn_cast<func::CallOp>(operation))
+      return isNonvolatileIndirectLoad(call);
+    if (isa<memref::AllocOp, bufferization::ToTensorOp>(operation))
+      return true;
+    // An op can expose both its own effects and recursive region effects.
+    // For example, a linalg.generic writing a private output may also write
+    // an alias of the load source from inside its region.
+    bool recursive = operation->hasTrait<OpTrait::HasRecursiveMemoryEffects>();
+    if (operation->getNumRegions() && !recursive)
+      return false;
+    if (recursive)
+      for (Region &region : operation->getRegions())
+        for (Block &block : region)
+          for (Operation &nested : block)
+            if (!canCross(&nested, load))
+              return false;
+    if (auto effects = dyn_cast<MemoryEffectOpInterface>(operation)) {
+      SmallVector<MemoryEffects::EffectInstance> instances;
+      effects.getEffects(instances);
+      return llvm::all_of(instances, [&](const auto &effect) {
+        return isa<MemoryEffects::Read>(effect.getEffect()) ||
+               (isa<MemoryEffects::Write>(effect.getEffect()) &&
+                effect.getValue() &&
+                isFreshPrivateBuffer(effect.getValue(), load));
+      });
+    }
+    return recursive || isMemoryEffectFree(operation);
+  }
+
+  bool canTileLoad(func::CallOp call) const {
+    if (!isNonvolatileIndirectLoad(call) || call.getNumResults() != 1 ||
+        !call.getResult(0).hasOneUse() || call->getBlock() != dot->getBlock() ||
+        call.getNumOperands() < 2 ||
+        !isa<MemRefType>(call.getOperand(0).getType()))
+      return false;
+    auto resultType = dyn_cast<RankedTensorType>(call.getResult(0).getType());
+    if (!resultType)
+      return false;
+    for (Value operand : call.getOperands().drop_front()) {
+      auto operandType = dyn_cast<RankedTensorType>(operand.getType());
+      if (!operandType || operandType.getShape() != resultType.getShape())
+        return false;
+    }
+    return canCrossToDot(call);
+  }
+
+  bool canCrossToDot(Operation *load) const {
+    for (Operation *next = load->getNextNode(); next != dot;
+         next = next->getNextNode()) {
+      if (!next || !canCross(next, load))
+        return false;
+    }
+    return true;
+  }
+
+  Value extract(OpBuilder &builder, Value source,
+                ArrayRef<OpFoldResult> offsets,
+                ArrayRef<OpFoldResult> sizes) const {
+    SmallVector<OpFoldResult> strides(sizes.size(), builder.getIndexAttr(1));
+    return builder.create<tensor::ExtractSliceOp>(dot->getLoc(), source,
+                                                  offsets, sizes, strides);
+  }
+
+  triton::DotScaledOp dot;
+  ConversionPatternRewriter &rewriter;
+  llvm::SmallPtrSet<Operation *, 2> eligibleLoads;
+  llvm::SmallPtrSet<Operation *, 2> replacedLoads;
+  llvm::SmallPtrSet<Operation *, 2> eligibleCopies;
+  llvm::SmallPtrSet<Operation *, 2> replacedCopies;
+};
+
+struct EraseTiledScaledDotLoad : OpRewritePattern<func::CallOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(func::CallOp call,
+                                PatternRewriter &rewriter) const override {
+    auto volatility = call->getAttrOfType<BoolAttr>("isVolatile");
+    if (!call->hasAttr("tt.scaled_dot_tiled") || !call->use_empty() ||
+        !call.getCallee().starts_with("triton_indirect_load") || !volatility ||
+        volatility.getValue())
+      return failure();
+    rewriter.eraseOp(call);
+    return success();
+  }
+};
+struct EraseTiledScaledDotCopy : OpRewritePattern<scf::ForOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(scf::ForOp loop,
+                                PatternRewriter &rewriter) const override {
+    if (!loop->hasAttr("tt.scaled_dot_tiled") || loop.getNumResults() != 0)
+      return failure();
+    memref::AllocOp allocation;
+    for (auto copy : loop.getBody()->getOps<memref::CopyOp>()) {
+      auto view = copy.getTarget().getDefiningOp<memref::SubViewOp>();
+      if (!view || allocation)
+        return failure();
+      allocation = view.getSource().getDefiningOp<memref::AllocOp>();
+    }
+    if (!allocation)
+      return failure();
+    SmallVector<Operation *> deadTensors;
+    for (Operation *user : allocation->getUsers()) {
+      if (loop->isProperAncestor(user))
+        continue;
+      if (!isa<bufferization::ToTensorOp>(user) || !user->use_empty())
+        return failure();
+      deadTensors.push_back(user);
+    }
+    for (Operation *tensor : deadTensors)
+      rewriter.eraseOp(tensor);
+    rewriter.eraseOp(loop);
+    if (allocation->use_empty())
+      rewriter.eraseOp(allocation);
+    return success();
+  }
+};
+} // namespace
+
+void populateScaledDotCanonicalizationPatterns(RewritePatternSet &patterns) {
+  patterns.add<EraseTiledScaledDotLoad, EraseTiledScaledDotCopy>(
+      patterns.getContext());
+}
+
 LogicalResult
 DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
                                     ConversionPatternRewriter &rewriter) const {
@@ -3140,6 +3609,13 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
                      dstType.getElementType().isF32() && op.getLhsKPack() &&
                      op.getRhsKPack() && hasE8M0Scale(lhsScale) &&
                      hasE8M0Scale(rhsScale);
+  // Native MX retains its complete product and accumulator. Its indirect
+  // reads may use their exact signed i32 offsets without materializing i64.
+  if (useNativeMx) {
+    narrowNativeScaledDotOffsets({lhs, rhs}, rewriter);
+    lhs = rewriter.getRemappedValue(lhs);
+    rhs = rewriter.getRemappedValue(rhs);
+  }
   // Bound M, N and K before the software path decodes inputs to f32.
   auto lhsTy = cast<RankedTensorType>(lhs.getType());
   int64_t logicalK = lhsTy.getShape().back();
@@ -3158,6 +3634,8 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
        logicalK > fallbackTile)) {
     int64_t tileM = tileSize(dstType.getDimSize(0));
     int64_t tileN = tileSize(dstType.getDimSize(1));
+    ScaledDotLoadTiler loadTiler(op, rewriter);
+    loadTiler.prepare({lhs, rhs, lhsScale, rhsScale});
     int64_t tileK = tileSize(logicalK);
     auto f32Type = dstType.clone(rewriter.getF32Type());
     if (c.getType() != f32Type)
@@ -3183,9 +3661,7 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
       SmallVector<OpFoldResult> offsets{row, col};
       SmallVector<OpFoldResult> sizes{builder.getIndexAttr(rows),
                                       builder.getIndexAttr(cols)};
-      SmallVector<OpFoldResult> strides(2, builder.getIndexAttr(1));
-      return builder.create<tensor::ExtractSliceOp>(loc, source, offsets, sizes,
-                                                    strides);
+      return loadTiler.slice(builder, source, offsets, sizes);
     };
     auto operandSlice = [&](OpBuilder &builder, Value operand, Value row,
                             Value col, int64_t rows, int64_t cols, bool fp4,
@@ -3296,6 +3772,7 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
       result = trunc;
     }
     rewriter.replaceOp(op, result);
+    loadTiler.markOriginalLoads();
     return success();
   }
 
