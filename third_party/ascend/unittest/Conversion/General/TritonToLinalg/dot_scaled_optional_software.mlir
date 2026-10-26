@@ -30,4 +30,3 @@ func.func @fp16_missing_both_small_k(%a: tensor<16x16xf16>, %b: tensor<16x32xf16
   %d = tt.dot_scaled %a, %b, %c lhs = fp16 rhs = fp16 {fastMath = true} : tensor<16x16xf16> * tensor<16x32xf16> -> tensor<16x32xf32>
   return %d : tensor<16x32xf32>
 }
-
