@@ -881,7 +881,10 @@ LogicalResult UnstructuredMemAccessConverter<MemAccOpTy>::matchAndRewrite(
   });
 
   if constexpr (std::is_same_v<MemAccOpTy, triton::LoadOp>) {
-    if (ptrOffsetInfo.isScalarLike() &&
+    // A select after an unconditional scalar load cannot protect an invalid
+    // pointer when every mask lane is false. Keep masked loads on the guarded
+    // scalar-loop path below.
+    if (!op.getMask() && ptrOffsetInfo.isScalarLike() &&
         succeeded(splatAndLoadScenario(op, ptrOffsetInfo, rewriter))) {
       return success();
     }
