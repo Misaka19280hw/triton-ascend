@@ -1,13 +1,25 @@
 // Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-#include "Selection.h"
+#include "BlockAuto/Analysis.h"
+#include "bishengir/Dialect/HACC/IR/HACC.h"
+#include "bishengir/Dialect/HIVM/IR/HIVM.h"
+#include "mlir/Analysis/DataLayoutAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/DLTI/DLTI.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
+#include "mlir/Interfaces/DataLayoutInterfaces.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
+#include "mlir/Parser/Parser.h"
+#include "mlir/Pass/AnalysisManager.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMIRToLLVMTranslation.h"
 #include "mlir/Target/LLVMIR/Import.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/IR/Constants.h"
@@ -17,7 +29,9 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/Regex.h"
 #include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -30,8 +44,106 @@
 #include <queue>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <tuple>
 #include <variant>
+#include <vector>
+
+namespace mlir::triton::ascend {
+llvm::json::Object analyzeBlockCandidate(const llvm::json::Object &config);
+namespace blockauto {
+using namespace llvm;
+using O = json::Object;
+using A = json::Array;
+using V = json::Value;
+inline void check(bool valid, StringRef reason) {
+  if (!valid)
+    throw std::runtime_error(reason.str());
+}
+inline const V &get(const O &o, StringRef key) {
+  static const V missing = nullptr;
+  auto *v = o.get(key);
+  return v ? *v : missing;
+}
+inline const O &object(const V &v) {
+  check(v.getAsObject(), "expected an object");
+  return *v.getAsObject();
+}
+inline const O &sub(const O &o, StringRef key) { return object(get(o, key)); }
+inline const O &optional(const O &o, StringRef key) {
+  static const O empty;
+  auto *v = o.getObject(key);
+  return v ? *v : empty;
+}
+inline const A &array(const O &o, StringRef key) {
+  auto *v = o.getArray(key);
+  check(v, "missing array: " + key.str());
+  return *v;
+}
+inline std::string str(const O &o, StringRef key, StringRef fallback = "") {
+  return o.getString(key).value_or(fallback).str();
+}
+inline int64_t integer(const V &v) {
+  auto n = v.getAsInteger();
+  check(bool(n), "expected an integer");
+  return *n;
+}
+inline int64_t integer(const O &o, StringRef key, int64_t fallback = 0) {
+  return o.get(key) ? integer(*o.get(key)) : fallback;
+}
+inline double number(const O &o, StringRef key) {
+  auto n = o.getNumber(key);
+  check(n && std::isfinite(*n), "missing finite number: " + key.str());
+  return *n;
+}
+inline bool flag(const O &o, StringRef key) {
+  return o.getBoolean(key).value_or(false);
+}
+inline void update(O &o, O values) {
+  for (auto &v : values)
+    o[v.first] = std::move(v.second);
+}
+inline int64_t product(const A &values) {
+  int64_t n = 1;
+  for (const V &v : values) {
+    int64_t x = integer(v);
+    check(x > 0 && n <= INT64_MAX / x, "nonpositive or overflowing extent");
+    n *= x;
+  }
+  return n;
+}
+std::vector<std::string> matches(StringRef text, const Regex &pattern,
+                                 unsigned group = 1);
+class CandidateIRAnalysis;
+bool preservesGrid(const O &metadata);
+std::string rejection(const O &item, const O &contract,
+                      const CandidateIRAnalysis &ir);
+O modelConfig(const O &item, const O &contract, const A &arguments,
+              const CandidateIRAnalysis &ir);
+std::string mergeKind(const O &metadata, int64_t factor, bool frontend = false);
+O planCV(const O &request);
+O rankCV(const O &records, const O &contract);
+bool excluded(StringRef status, bool vv = true);
+} // namespace blockauto
+} // namespace mlir::triton::ascend
+
+namespace mlir::triton::ascend::blockauto {
+// Allocation and lowering legality belong to the compiler passes.
+class CandidateIRAnalysis {
+public:
+  CandidateIRAnalysis(Operation *op, AnalysisManager &manager);
+  int64_t spec(StringRef key) const;
+  void checkResources(const O &item) const;
+  A launchArguments(const O &contract, const O &metadata) const;
+  std::string metaLibrary() const;
+
+private:
+  ModuleOp module;
+  const DataLayout &layout;
+};
+void registerCandidateDialects(DialectRegistry &registry);
+OwningOpRef<ModuleOp> parseCandidateIR(StringRef source, MLIRContext &context);
+} // namespace mlir::triton::ascend::blockauto
 
 namespace mlir::triton::ascend {
 namespace blockauto {
@@ -1651,5 +1763,647 @@ json::Object analyzeBlockCandidate(const json::Object &config) {
   }
   check(number(result, "score") >= 0, "invalid static cost");
   return result;
+}
+} // namespace mlir::triton::ascend
+
+namespace mlir::triton::ascend::blockauto {
+void registerCandidateDialects(DialectRegistry &registry) {
+  registry.insert<arith::ArithDialect, cf::ControlFlowDialect, DLTIDialect,
+                  func::FuncDialect, LLVM::LLVMDialect, memref::MemRefDialect,
+                  scf::SCFDialect, hacc::HACCDialect, hivm::HIVMDialect>();
+}
+OwningOpRef<ModuleOp> parseCandidateIR(StringRef input, MLIRContext &context) {
+  std::string source = input.str();
+  // BiSheng LLVM 20 emits ':' here; the host LLVM 22 DLTI syntax uses '='.
+  StringRef old = "#dlti.target_system_spec<\"NPU\" :";
+  if (auto pos = source.find(old.str()); pos != std::string::npos)
+    source[pos + old.size() - 1] = '=';
+  auto module =
+      parseSourceString<ModuleOp>(source, ParserConfig(&context, false));
+  check(bool(module), "cannot parse candidate final MLIR");
+  return module;
+}
+CandidateIRAnalysis::CandidateIRAnalysis(Operation *op,
+                                         AnalysisManager &manager)
+    : module(cast<ModuleOp>(op)),
+      layout(manager.getAnalysis<DataLayoutAnalysis>().getAtOrAbove(op)) {}
+int64_t CandidateIRAnalysis::spec(StringRef key) const {
+  auto *ctx = module->getContext();
+  auto value = layout.getDevicePropertyValue(StringAttr::get(ctx, "NPU"),
+                                             StringAttr::get(ctx, key));
+  auto number = value ? dyn_cast<IntegerAttr>(*value) : IntegerAttr{};
+  check(number && number.getInt() > 0,
+        "missing target specification: " + key.str());
+  return number.getInt();
+}
+std::string CandidateIRAnalysis::metaLibrary() const {
+  auto bitcode =
+      module->getAttrOfType<hivm::AIV_BITCODEAttr>("hivm.aiv_bitcode");
+  return bitcode ? bitcode.getPath().getValue().str() : "";
+}
+void CandidateIRAnalysis::checkResources(const O &item) const {
+  const O &metadata = sub(item, "metadata");
+  std::string mode = str(metadata, "parallel_mode");
+  check(str(sub(metadata, "target"), "arch") == "Ascend950PR_9579",
+        "cost model target is outside the validated A5 profile");
+  bool vv = str(metadata, "mix_mode") == "aiv",
+       mixed = vv && mode == "mix_simd_simt", bound = false, hasUB = false;
+  int64_t capacity = spec("UB_SIZE"),
+          alignment = vv ? spec("UB_ALIGN_SIZE") : 8, end = -1;
+  auto isUB = [](Type type) {
+    auto memref = dyn_cast<MemRefType>(type);
+    auto space =
+        memref
+            ? dyn_cast_or_null<hivm::AddressSpaceAttr>(memref.getMemorySpace())
+            : hivm::AddressSpaceAttr{};
+    return space && space.getAddressSpace() == hivm::AddressSpace::UB;
+  };
+  module->walk([&](Operation *op) {
+    hasUB |= llvm::any_of(op->getResultTypes(), isUB) ||
+             llvm::any_of(op->getOperandTypes(), isUB);
+    if (isa<memref::AllocOp, memref::AllocaOp>(op))
+      check(!isUB(op->getResult(0).getType()),
+            "unresolved UB allocation remains in final IR");
+    auto cast = dyn_cast<hivm::PointerCastOp>(op);
+    if (!cast || !isUB(cast.getType()))
+      return;
+    auto type = mlir::cast<MemRefType>(cast.getType());
+    check(type.hasStaticShape() && type.getLayout().isIdentity(),
+          "UB pointer has an unproved shape or layout");
+    auto width = layout.getTypeSizeInBits(type.getElementType());
+    check(!width.isScalable(), "scalable UB element size");
+    int64_t bits = width.getFixedValue();
+    bool conservative = vv && bits == 1;
+    check(conservative || (bits >= 8 && bits % 8 == 0),
+          "unsupported UB element width");
+    A factors{conservative ? 8 : bits};
+    for (int64_t dim : type.getShape())
+      factors.push_back(dim);
+    bits = product(factors);
+    for (auto addr : cast.getAddrs()) {
+      APInt offset;
+      check(matchPattern(addr, m_ConstantInt(&offset)) &&
+                offset.isNonNegative() && offset.isSignedIntN(64),
+            "UB pointer has an unproved offset");
+      int64_t start = offset.getSExtValue();
+      check(bits <= INT64_MAX - alignment + 1 &&
+                start <= (INT64_MAX - bits - alignment + 1) / 8,
+            "UB extent overflow");
+      end = std::max(end, start * 8 + int64_t(llvm::alignTo(bits, alignment)));
+    }
+    bound |= conservative;
+  });
+  if (end < 0) {
+    check(!module->getRegion(0).getOps<func::FuncOp>().empty() && !vv &&
+              !item.get("llvm_aiv") && !hasUB,
+          "no verifiable static UB allocation in final IR");
+    end = 0;
+  }
+  if (vv) {
+    check(mode == "simd" || mixed,
+          "only AIV SIMD and MIX resource proofs are supported");
+    if (mixed) {
+      int64_t dynamic = integer(metadata, "shared_mem_dynamic_size"),
+              full = capacity;
+      check(dynamic > 0 && dynamic <= INT64_MAX / 8,
+            "missing runtime dynamic UB size");
+      capacity = dynamic * 8;
+      check(full - spec("MAXIMUM_D_CACHE_SIZE") <= capacity &&
+                capacity <= full - spec("MINIMAL_D_CACHE_SIZE"),
+            "MIX dynamic UB conflicts with D-cache reservation");
+    }
+  }
+  check(end <= capacity, bound ? "i1 conservative UB upper bound exceeds "
+                                 "capacity; actual overflow unconfirmed"
+                               : "final UB address exceeds capacity");
+}
+} // namespace mlir::triton::ascend::blockauto
+
+namespace mlir::triton::ascend::blockauto {
+A CandidateIRAnalysis::launchArguments(const O &contract,
+                                       const O &metadata) const {
+  const O &arguments = sub(contract, "arguments");
+  const A &order = array(contract, "argument_order"),
+          &grid = array(contract, "grid");
+  check(grid.size() == 3 && order.size() == arguments.size(),
+        "launch ABI mismatch");
+  A args{nullptr, nullptr}; // TA synchronization and workspace pointers.
+  std::set<std::string> seen;
+  for (const V &name : order) {
+    check(bool(name.getAsString()), "missing host argument name");
+    std::string key = name.getAsString()->str();
+    check(seen.insert(key).second, "launch ABI mismatch");
+    const O &arg = sub(arguments, key);
+    check(str(arg, "kind") == "tensor" || str(arg, "kind") == "scalar",
+          "unsupported host argument");
+    args.push_back(str(arg, "kind") == "scalar" ? get(arg, "value")
+                                                : V(nullptr));
+  }
+  // The compiler records hidden extents in ABI order; SSA names are irrelevant.
+  if (auto *axes = optional(metadata, "program_grid_transforms")
+                       .getArray("hidden_extent_axes"))
+    for (const V &value : *axes) {
+      int64_t axis = integer(value);
+      check(axis >= 0 && axis < 3, "invalid original grid axis");
+      args.push_back(grid[axis]);
+    }
+  auto entry = dyn_cast_or_null<FunctionOpInterface>(
+      SymbolTable::lookupSymbolIn(module, str(metadata, "name")));
+  if (!entry)
+    entry = dyn_cast_or_null<FunctionOpInterface>(SymbolTable::lookupSymbolIn(
+        module, str(metadata, "name") + "_mix_aic"));
+  check(entry && entry.getNumArguments() == args.size() + 3,
+        "launch/final IR ABI mismatch");
+  return args;
+}
+bool preservesGrid(const O &metadata) {
+  // Lowering legality and loop proofs belong to the compiler pass.
+  return str(optional(metadata, "block_batching"), "vv_lowering") ==
+         "sequential_iterations_v1";
+}
+std::string rejection(const O &item, const O &contract,
+                      const CandidateIRAnalysis &ir) {
+  const O &metadata = sub(item, "metadata");
+  A grid(array(contract, "grid"));
+  int64_t tasks = product(grid), factor = integer(item, "factor"),
+          axis = integer(item, "axis");
+  const V *floor = contract.get("runtime_core_floor");
+  if (!floor)
+    floor = contract.get("core_floor");
+  if (floor && floor->getAsString())
+    check(!floor->getAsString()->empty() &&
+              floor->getAsString()->find_first_not_of("0123456789") ==
+                  StringRef::npos,
+          "invalid core floor");
+  int64_t cores =
+      floor && floor->kind() != V::Null
+          ? (floor->getAsString() ? std::stoll(floor->getAsString()->str())
+                                  : integer(*floor))
+          : ir.spec("VECTOR_CORE_COUNT");
+  check(cores >= 0, "invalid core floor");
+  if (factor == 1)
+    return "";
+  bool preserve = preservesGrid(metadata);
+  if (!preserve)
+    grid[axis] = (integer(grid[axis]) - 1) / factor + 1;
+  int64_t merged = product(grid);
+  if (!preserve && merged >= tasks)
+    return "GRID_NOT_REDUCED";
+  return merged < cores ? "GRID_BELOW_CORE_FLOOR" : "";
+}
+O modelConfig(const O &item, const O &contract, const A &arguments,
+              const CandidateIRAnalysis &ir) {
+  const O &metadata = sub(item, "metadata");
+  std::string mode = str(metadata, "parallel_mode");
+  bool vv = str(metadata, "mix_mode") == "aiv",
+       preserve = vv && preservesGrid(metadata);
+  int64_t factor = integer(item, "factor"), axis = integer(item, "axis"),
+          cores = ir.spec(vv ? "VECTOR_CORE_COUNT" : "CUBE_CORE_COUNT");
+  check(mode == "simd" || (vv && mode == "mix_simd_simt"),
+        "unmodelled execution mode");
+  check(!flag(metadata, "ptsm_cap_authorized") &&
+            !flag(metadata, "row_coalescing_applied") &&
+            (!preserve ||
+             (!flag(metadata, "program_grid_mapping_applied") &&
+              get(metadata, "program_grid_transforms").kind() == V::Null)) &&
+            integer(metadata, "coalesce_factor", 1) == 1,
+        "additional grid transform");
+  A grid(array(contract, "grid")), args(arguments);
+  product(grid);
+  if (factor != 1 && !preserve)
+    grid[axis] = (integer(grid[axis]) - 1) / factor + 1;
+  for (const V &n : grid)
+    args.push_back(n);
+  int64_t blocks = product(grid);
+  check(bool(metadata.getBoolean("auto_blockify_enabled")),
+        "missing automatic block dispatch setting");
+  bool automatic = flag(metadata, "auto_blockify_enabled");
+  if (automatic)
+    blocks = std::min(blocks, cores);
+  O modules;
+  if (vv)
+    modules["aiv"] = "";
+  else {
+    for (StringRef role : {"aic", "aiv"})
+      if (item.get("llvm_" + role.str()))
+        modules[role] = "";
+    if (modules.empty() && item.get("llvm"))
+      modules["aic"] = "";
+    if (modules.get("aiv"))
+      check(ir.spec("VECTOR_CORE_COUNT") == cores * 2,
+            "only one Cube with two Vector subblocks is modelled");
+  }
+  O config{{"mode", vv ? "vv" : "cv"},
+           {"modules", std::move(modules)},
+           {"name", get(metadata, "name")},
+           {"arguments", std::move(args)},
+           {"grid", std::move(grid)},
+           {"cores", cores},
+           {"blocks", blocks},
+           {"auto_blockify", automatic}};
+  if (vv) {
+    if (mode == "mix_simd_simt")
+      config["mixed"] = O{{"simt_transaction_bytes", 64},
+                          {"simt_transition_cycles", 32},
+                          {"simt_instruction_cycles", 1}};
+  }
+  return config;
+}
+} // namespace mlir::triton::ascend::blockauto
+
+namespace mlir::triton::ascend::blockauto {
+std::string mergeKind(const O &metadata, int64_t factor, bool frontend) {
+  if (factor == 1)
+    return "unmerged";
+  const O &report = frontend ? metadata : optional(metadata, "block_batching");
+  check(!frontend || str(report, "compile_status") == "REWRITTEN",
+        "frontend did not admit the CV rewrite");
+  if (str(report, "cv_mode") == "independent_batch_v1")
+    return frontend ? "batch" : "independent_batch";
+  std::string lowering = str(report, "cv_lowering");
+  if (frontend && StringRef(lowering).ends_with("_uniform_control"))
+    lowering.resize(lowering.size() - 16);
+  if (str(report, "cv_mode") == "spatial_concat_v1") {
+    if (lowering == "spatial_m_v1")
+      return "M";
+    if (lowering == "spatial_n_v1")
+      return "N";
+  }
+  throw std::runtime_error("compiler CV axis role is not covered");
+}
+O planCV(const O &request) {
+  const A &grid = array(sub(request, "contract"), "grid");
+  int64_t selectedAxis = integer(request, "axis", -1);
+  check(grid.size() == 3 && selectedAxis >= -1 && selectedAxis < 3,
+        "invalid CV launch grid or axis");
+  product(grid);
+  A probes;
+  auto result = [](StringRef reason, A candidates = {}) {
+    return O{{"reason", reason}, {"candidates", std::move(candidates)}};
+  };
+  if (!request.get("reports")) {
+    for (int64_t axis = 0; axis < 3; ++axis)
+      for (int64_t factor : {2, 4})
+        if ((selectedAxis == -1 || selectedAxis == axis) &&
+            integer(grid[axis]) >= factor && integer(grid[axis]) % factor == 0)
+          probes.push_back(O{{"axis", axis}, {"factor", factor}});
+    return O{{"probes", std::move(probes)}};
+  }
+  std::map<std::string, A> admitted;
+  std::map<int64_t, std::string> roles;
+  for (const V &value : array(request, "reports")) {
+    try {
+      O item(object(value));
+      int64_t axis = integer(item, "axis"), factor = integer(item, "factor");
+      check(axis >= 0 && axis < 3 && (factor == 2 || factor == 4) &&
+                (selectedAxis == -1 || axis == selectedAxis) &&
+                integer(grid[axis]) >= factor &&
+                integer(grid[axis]) % factor == 0,
+            "invalid probe");
+      const O &report = sub(item, "report");
+      check(integer(report, "selected_axis", -1) == axis &&
+                integer(report, "requested_factor") == factor,
+            "frontend selected a different axis or factor");
+      std::string kind = mergeKind(report, factor, true);
+      auto [role, inserted] = roles.emplace(axis, kind);
+      if (!inserted && role->second != kind)
+        return result("CV_AXIS_ROLE_DEPENDS_ON_FACTOR");
+      admitted[kind].push_back(
+          O{{"axis", axis},
+            {"factor", factor},
+            {"key", "a" + std::to_string(axis) + "_f" + std::to_string(factor)},
+            {"merge_kind", kind}});
+    } catch (const std::exception &) {
+    }
+  }
+  auto order = [](const V &v) {
+    const O &o = object(v);
+    return std::make_pair(integer(o, "axis"), integer(o, "factor"));
+  };
+  for (auto &[kind, candidates] : admitted)
+    std::sort(candidates.begin(), candidates.end(),
+              [&](const V &a, const V &b) { return order(a) < order(b); });
+  A spatial;
+  const O *m = nullptr, *n = nullptr;
+  for (const std::string kind : {"M", "N"})
+    for (const V &v : admitted[kind]) {
+      const O &o = object(v);
+      spatial.push_back(v);
+      if (integer(o, "factor") == 4) {
+        auto &slot = kind == "M" ? m : n;
+        if (!slot)
+          slot = &o;
+      }
+    }
+  if (m && n)
+    return result("CV_M4_N4", A{O(*m), O(*n)});
+  if (m || n) {
+    A candidates;
+    for (const V &v : spatial)
+      if (integer(object(v), "axis") == integer(m ? *m : *n, "axis"))
+        candidates.push_back(v);
+    return result("CV_ONE_SPATIAL_AXIS_F2_F4", std::move(candidates));
+  }
+  if (!spatial.empty()) {
+    while (spatial.size() > 2)
+      spatial.pop_back();
+    return result("CV_SPATIAL_F2_ONLY", std::move(spatial));
+  }
+  A batch;
+  for (const V &v : admitted["batch"])
+    if (batch.empty() ||
+        integer(object(v), "axis") == integer(object(batch.front()), "axis"))
+      batch.push_back(v);
+  StringRef reason = batch.empty() ? "CV_NO_ADMITTED_MERGE" : "CV_BATCH_F2_F4";
+  return result(reason, std::move(batch));
+}
+O rankCV(const O &records, const O &contract) {
+  A incomplete;
+  for (const auto &[key, value] : records) {
+    const O &row = object(value);
+    if (!flag(row, "resource_checked") &&
+        (integer(row, "factor") == 1 || !excluded(str(row, "status"), false)))
+      incomplete.push_back(key.str());
+  }
+  if (!incomplete.empty())
+    return O{{"reason", "CV_MODEL_INCOMPLETE"},
+             {"incomplete_candidates", std::move(incomplete)}};
+  const O &baseline = sub(records, "unmerged");
+  const A &original = array(contract, "grid");
+  std::vector<std::string> eligible;
+  for (const auto &[key, value] : records) {
+    const O &row = object(value);
+    int64_t factor = integer(row, "factor"), axis = integer(row, "axis");
+    if (factor == 1 || !flag(row, "resource_checked") ||
+        integer(original[axis]) % factor)
+      continue;
+    if (get(row, "mode") == get(baseline, "mode") &&
+        get(row, "cube_core_count") == get(baseline, "cube_core_count") &&
+        get(row, "useful_flops") == get(baseline, "useful_flops"))
+      eligible.push_back(key.str());
+  }
+  auto order = [&](const std::string &key) {
+    const O &r = sub(records, key);
+    return std::make_tuple(number(r, "estimated_cycles"), integer(r, "factor"),
+                           integer(r, "axis"));
+  };
+  std::string selected = "unmerged";
+  for (const auto &key : eligible)
+    if (order(key) < order(selected))
+      selected = key;
+  std::string reason = eligible.empty()         ? "MERGED_RESOURCE_UNAVAILABLE"
+                       : selected == "unmerged" ? "ORIGINAL_LOWEST_LATENCY"
+                                                : "LOWER_ESTIMATED_LATENCY";
+  bool spatial = std::any_of(records.begin(), records.end(), [](const auto &v) {
+    auto kind = str(object(v.second), "merge_kind");
+    return kind == "M" || kind == "N";
+  });
+  if (contract.getBoolean("cv_empirical_short_batch").value_or(true) &&
+      product(original) <= integer(baseline, "cube_core_count") && !spatial) {
+    std::vector<std::pair<int64_t, std::string>> preferred;
+    for (const auto &key : eligible) {
+      const O &row = sub(records, key);
+      int64_t axis = integer(row, "axis");
+      bool single = true;
+      for (int64_t i = 0; i < 3; ++i)
+        if (i != axis && integer(original[i]) != 1)
+          single = false;
+      if (str(row, "merge_kind") == "independent_batch" &&
+          integer(row, "factor") == 2 && single)
+        preferred.emplace_back(axis, key);
+    }
+    if (!preferred.empty()) {
+      selected = std::min_element(preferred.begin(), preferred.end())->second;
+      reason = "EMPIRICAL_SINGLE_TILE_SHORT_BATCH_X2";
+    }
+  }
+  return O{
+      {"selected_key", selected}, {"reason", reason}, {"model_complete", true}};
+}
+} // namespace mlir::triton::ascend::blockauto
+
+namespace mlir::triton::ascend::blockauto {
+bool excluded(StringRef status, bool vv) {
+  return status == "UB_REJECTED" || status == "COMPILE_REJECTED" ||
+         status == "FRONTEND_REJECTED" || status == "NO_MERGE_OPPORTUNITY" ||
+         (vv && status == "RUNTIME_REJECTED");
+}
+static std::string key(const O &item) {
+  return integer(item, "factor") == 1
+             ? "unmerged"
+             : "a" + std::to_string(integer(item, "axis")) + "_f" +
+                   std::to_string(integer(item, "factor"));
+}
+static O prepare(const O &item, const O &contract, MLIRContext &context) {
+  O state{
+      {"key", key(item)}, {"resource_checked", false}, {"needs_llvm", false}};
+  bool vv = false;
+  try {
+    if (!item.get("metadata")) {
+      if (!excluded(str(item, "status")))
+        state["status"] = "RESOURCE_UNCONFIRMED";
+      return state;
+    }
+    auto module = parseCandidateIR(str(item, "final_ir"), context);
+    ModuleAnalysisManager manager(module->getOperation(), nullptr);
+    auto &ir = AnalysisManager(manager).getAnalysis<CandidateIRAnalysis>();
+    ir.checkResources(item);
+    A arguments = ir.launchArguments(contract, sub(item, "metadata"));
+    state["resource_checked"] = true;
+    vv = str(sub(item, "metadata"), "mix_mode") == "aiv";
+    state["vv"] = vv;
+    int64_t factor = integer(item, "factor"), axis = integer(item, "axis");
+    check((factor == 1 || factor == 2 || factor == 4) &&
+              (factor == 1 || (axis >= 0 && axis < 3)),
+          "invalid merge factor or axis");
+    if (vv) {
+      std::string reason = rejection(item, contract, ir);
+      if (!reason.empty()) {
+        update(state, O{{"status", "RUNTIME_REJECTED"}, {"error", reason}});
+        return state;
+      }
+      auto path = ir.metaLibrary();
+      if (!path.empty())
+        state["meta_library"] = path;
+    } else
+      state["merge_kind"] =
+          mergeKind(sub(item, "metadata"), integer(item, "factor"));
+    state["config"] = modelConfig(item, contract, arguments, ir);
+    state["needs_llvm"] = vv;
+  } catch (const std::exception &error) {
+    if (!flag(state, "resource_checked"))
+      state["status"] = "RESOURCE_UNCONFIRMED";
+    else if (vv)
+      state["status"] = "STATIC_ANALYSIS_UNSUPPORTED";
+    state["error"] = std::string(error.what());
+  }
+  return state;
+}
+using Items = std::map<std::string, const O *>;
+static O rank(const Items &items, const O &contract) {
+  O result{{"model", "jit-cv-vv-native-v1"},
+           {"selected_key", "unmerged"},
+           {"selected_axis", -1},
+           {"model_complete", false},
+           {"reason", "BASELINE_FALLBACK_INCOMPLETE_MODEL"},
+           {"candidates", O{}},
+           {"device_timing_used", false},
+           {"factor", 1}};
+  try {
+    const O &baseline = *items.at("unmerged");
+    if (!flag(baseline, "resource_checked")) {
+      O states;
+      for (const auto &[key, value] : items) {
+        O row;
+        const O &item = *value;
+        for (StringRef field :
+             {"factor", "axis", "status", "error", "resource_checked"})
+          if (item.get(field))
+            row[field] = get(item, field);
+        states[key] = std::move(row);
+      }
+      update(result, O{{"reason", "BASELINE_RESOURCE_UNCONFIRMED"},
+                       {"candidates", std::move(states)}});
+      return result;
+    }
+    bool vv = flag(baseline, "vv");
+    if (!vv) {
+      bool tensor = false;
+      for (const auto &[name, value] : sub(contract, "arguments")) {
+        const O &arg = object(value);
+        if (str(arg, "kind") != "tensor")
+          continue;
+        tensor = true;
+        std::string type = str(arg, "dtype");
+        if (type != "fp32" && type != "float32" && type != "torch.float32") {
+          result["reason"] = "CV_DTYPE_NOT_COVERED";
+          return result;
+        }
+      }
+      if (!tensor) {
+        result["reason"] = "CV_DTYPE_NOT_COVERED";
+        return result;
+      }
+    }
+    O records;
+    for (const auto &[key, value] : items) {
+      const O &item = *value;
+      O row{{"factor", get(item, "factor")},
+            {"axis", get(item, "axis")},
+            {"resource_checked", vv && flag(item, "resource_checked")},
+            {"status", str(item, "status",
+                           vv ? "STATIC_ANALYSIS_UNSUPPORTED"
+                              : "STATIC_ANALYSIS_UNCONFIRMED")}};
+      if (vv)
+        row["error"] = get(item, "error");
+      try {
+        check(flag(item, "resource_checked"),
+              str(item, "error", "candidate resource evidence unavailable"));
+        if (vv && (!flag(item, "needs_llvm") || !item.get("optimized_llvm"))) {
+          records[key] = std::move(row);
+          continue;
+        }
+        check(item.getObject("config"),
+              str(item, "error", "missing analysis configuration"));
+        O config(sub(item, "config"));
+        for (auto &[role, source] : *config.getObject("modules"))
+          source = item.getString(vv ? "optimized_llvm" : "llvm_" + role.str())
+                       .value_or(item.getString("llvm").value_or(""));
+        O trace = analyzeBlockCandidate(config);
+        if (vv)
+          update(row, std::move(trace));
+        else {
+          double score = number(trace, "score");
+          const O &counts = sub(trace, "counts");
+          check(number(counts, "mma_calls") > 0 && score > 0,
+                "incomplete Cube accounting");
+          update(row, O{{"status", "STATIC_FEATURES_READY"},
+                        {"resource_checked", true},
+                        {"estimated_cycles", score},
+                        {"merge_kind", get(item, "merge_kind")},
+                        {"batch_grid", get(trace, "logical_grid")},
+                        {"mode", get(trace, "mode")},
+                        {"useful_flops", get(counts, "useful_flops")},
+                        {"cube_core_count", get(trace, "cube_core_count")}});
+        }
+      } catch (const std::exception &error) {
+        row["error"] = std::string(error.what());
+        if (vv && flag(item, "resource_checked"))
+          row["status"] = "STATIC_ANALYSIS_UNSUPPORTED";
+      }
+      records[key] = std::move(row);
+    }
+    if (vv) {
+      bool complete = !records.empty();
+      std::string best;
+      auto order = [&](const std::string &name) {
+        const O &o = sub(records, name);
+        return std::make_tuple(number(o, "score"), integer(o, "factor"), name);
+      };
+      for (const auto &[key, value] : records) {
+        const O &row = object(value);
+        bool scored = row.getNumber("score") &&
+                      str(row, "status") == "STATIC_COST_ESTIMATED";
+        complete &= scored || excluded(str(row, "status"));
+        if (scored && (best.empty() || order(key.str()) < order(best)))
+          best = key.str();
+      }
+      if (complete && !best.empty())
+        update(result, O{{"selected_key", best},
+                         {"model_complete", true},
+                         {"reason", "LOWEST_STATIC_SCORE"}});
+    } else
+      update(result, rankCV(records, contract));
+    result["candidates"] = std::move(records);
+    const O &selected = *items.at(str(result, "selected_key"));
+    result["selected_axis"] = get(selected, "axis");
+    result["factor"] = get(selected, "factor");
+  } catch (const std::exception &error) {
+    result["error"] = std::string(error.what());
+  }
+  return result;
+}
+} // namespace mlir::triton::ascend::blockauto
+namespace mlir::triton::ascend {
+std::string selectBlockCandidates(llvm::StringRef request) {
+  using namespace blockauto;
+  auto parsed = json::parse(request);
+  if (!parsed)
+    throw std::runtime_error(toString(parsed.takeError()));
+  const O &input = object(*parsed), &contract = sub(input, "contract");
+  std::string action = str(input, "action");
+  O result;
+  if (action == "plan")
+    result = planCV(input);
+  else if (action == "prepare") {
+    DialectRegistry registry;
+    registerCandidateDialects(registry);
+    MLIRContext context(registry, MLIRContext::Threading::DISABLED);
+    context.allowUnregisteredDialects();
+    A states;
+    for (const V &value : array(input, "candidates"))
+      states.push_back(prepare(object(value), contract, context));
+    bool baselineReady =
+        std::any_of(states.begin(), states.end(), [](const V &v) {
+          return str(object(v), "key") == "unmerged" &&
+                 flag(object(v), "resource_checked");
+        });
+    if (!baselineReady)
+      for (V &v : states)
+        (*v.getAsObject())["needs_llvm"] = false;
+    result = O{{"candidates", std::move(states)}};
+  } else {
+    check(action == "rank", "unknown selector action");
+    Items items;
+    for (const V &value : array(input, "candidates")) {
+      const O &item = object(value);
+      items[key(item)] = &item;
+    }
+    result = rank(items, contract);
+  }
+  std::string output;
+  raw_string_ostream stream(output);
+  stream << V(std::move(result));
+  return output;
 }
 } // namespace mlir::triton::ascend
