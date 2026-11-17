@@ -1,18 +1,34 @@
 // RUN: split-file %s %t
-// RUN: triton-opt --pass-pipeline='any(triton-control-flow-opt,triton-to-structured{enable-mask-fallback-conversion=false optimize-dynamic-offset=false},discrete-mask-access-conversion{compile-mode=simd_simt_template compile-on-910-95=true},triton-to-annotation,triton-to-unstructure{compile-mode=simd_simt_template compile-on-910-95=true})' --verify-each %t/masked_scalar_like_load.mlir | FileCheck %s --check-prefix=SCALAR --implicit-check-not=tt.load
+// RUN: triton-opt --pass-pipeline='any(triton-control-flow-opt,triton-to-structured{enable-mask-fallback-conversion=false optimize-dynamic-offset=false},discrete-mask-access-conversion{compile-mode=simd_simt_template compile-on-910-95=true},triton-to-annotation,triton-to-unstructure{compile-mode=simd_simt_template compile-on-910-95=true})' --verify-each %t/masked_scalar_like_load.mlir | FileCheck %s --check-prefix=INDIRECT --implicit-check-not=tt.load --implicit-check-not=ascend.indirect_load
+// RUN: triton-opt %t/masked_scalar_like_load.mlir --triton-to-unstructure --verify-each | FileCheck %s --check-prefix=SCALAR --implicit-check-not=tt.load --implicit-check-not=ascend.indirect_load
 // RUN: triton-opt %t/prefix_zero_load.mlir --triton-to-unstructure --verify-each | FileCheck %s --check-prefix=PREFIX
 
 //--- masked_scalar_like_load.mlir
+// Shared pointer analysis materializes all lane offsets, enabling the template
+// path even when every lane uses the same address. It must retain the original
+// predicate and other value, without an unconditional load before selection.
+// INDIRECT-LABEL: tt.func public @block_batching_memory(
+// INDIRECT-SAME: %[[INPUT:[^:]+]]: !tt.ptr<f32>, %{{[^:]+}}: !tt.ptr<f32>, %{{[^:]+}}: i32, %[[GATE:[^:]+]]: i32
+// INDIRECT-DAG: %[[OFFSET:.*]] = arith.constant dense<1099511627776> : tensor<4xi64>
+// INDIRECT-DAG: %[[OTHER:.*]] = arith.constant dense<7.000000e+00> : tensor<4xf32>
+// INDIRECT-DAG: %[[ZERO:.*]] = arith.constant 0 : i32
+// INDIRECT: %[[ENABLED:.*]] = arith.cmpi slt, %[[GATE]], %[[ZERO]] : i32
+// INDIRECT: %[[MASK:.*]] = tt.splat %[[ENABLED]] : i1 -> tensor<4xi1>
+// INDIRECT: %[[VALUE:.*]] = ascend.indirect_load %[[INPUT]] : <f32>, %[[OFFSET]] : tensor<4xi64>, %[[MASK]] : tensor<4xi1>, %[[OTHER]] : tensor<4xf32>
+// INDIRECT: tt.store %{{.*}}, %[[VALUE]] : tensor<4x!tt.ptr<f32>>
+// INDIRECT: tt.return
+
 // SCALAR-LABEL: tt.func public @block_batching_memory(
 // SCALAR-SAME: %[[INPUT:[^:]+]]: !tt.ptr<f32>
 // The scalar fallback must bound the load loop by the original predicate.
 // A false predicate gives zero iterations; the final select restores other=7.
 // No load may escape the loop, even when followed by a select.
-// SCALAR: %[[OFFSET:.*]] = arith.constant 1099511627776 : i64
-// SCALAR: %[[ZERO:.*]] = arith.constant 0 : index
-// SCALAR: %[[ONE:.*]] = arith.constant 1 : index
-// SCALAR: %[[FOUR:.*]] = arith.constant 4 : index
-// SCALAR: %[[OTHER:.*]] = arith.constant dense<7.000000e+00> : tensor<4xf32>
+// SCALAR-DAG: %[[OFFSET:.*]] = arith.constant 1099511627776 : i64
+// SCALAR-DAG: %[[ZERO:.*]] = arith.constant 0 : index
+// SCALAR-DAG: %[[ONE:.*]] = arith.constant 1 : index
+// SCALAR-DAG: %[[FOUR:.*]] = arith.constant 4 : index
+// SCALAR-DAG: %[[OTHER:.*]] = arith.constant dense<7.000000e+00> : tensor<4xf32>
+// SCALAR-DAG: %[[PAD:.*]] = arith.constant 7.000000e+00 : f32
 // SCALAR: %[[ENABLED:.*]] = arith.cmpi slt,
 // SCALAR: %[[MASK:.*]] = tt.splat %[[ENABLED]] : i1 -> tensor<4xi1>
 // SCALAR: %[[ACTIVE:.*]] = arith.index_castui %[[ENABLED]] : i1 to index
@@ -20,7 +36,8 @@
 // SCALAR: %[[BOUND:.*]] = arith.minsi %[[COUNT]], %[[FOUR]] : index
 // SCALAR: %[[RESULT:.*]] = scf.for %[[IV:.*]] = %[[ZERO]] to %[[BOUND]] step %[[ONE]] iter_args(%[[ACC:.*]] = %{{.*}}) -> (tensor<4xf32>) {
 // SCALAR-NEXT: %[[PTR:.*]] = tt.addptr %[[INPUT]], %[[OFFSET]] : !tt.ptr<f32>, i64
-// SCALAR-NEXT: %[[VALUE:.*]] = tt.load %[[PTR]] {DiscreteMemAccess} : !tt.ptr<f32>
+// SCALAR-NEXT: %[[PRED:.*]] = tensor.extract %[[MASK]][%[[IV]]] {DiscreteMemAccess} : tensor<4xi1>
+// SCALAR-NEXT: %[[VALUE:.*]] = tt.load %[[PTR]], %[[PRED]], %[[PAD]] {DiscreteMemAccess} : !tt.ptr<f32>
 // SCALAR-NEXT: %[[INSERTED:.*]] = tensor.insert %[[VALUE]] into %[[ACC]][%[[IV]]] : tensor<4xf32>
 // SCALAR-NEXT: scf.yield {DiscreteMemAccess} %[[INSERTED]] : tensor<4xf32>
 // SCALAR-NEXT: } {ExtractedLoadOrStore}
