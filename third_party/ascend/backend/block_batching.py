@@ -266,6 +266,29 @@ def candidate_launch_refusal(request, report, grid, preserve_grid, capture, *, c
     return None
 
 
+class DeferredBaseline:
+    """Compile F1 only when the selected frontend candidate cannot be used."""
+
+    def __init__(self, key, compile_baseline):
+        import threading
+        self.hash = key
+        self._compile = compile_baseline
+        self._kernel = None
+        self._lock = threading.RLock()
+
+    def materialize(self):
+        with self._lock:
+            if self._kernel is None:
+                kernel = self._compile()
+                if kernel.hash != self.hash:
+                    raise RuntimeError("deferred baseline cache identity changed")
+                self._kernel = kernel
+            return self._kernel
+
+    def __getattr__(self, name):
+        return getattr(self.materialize(), name)
+
+
 class BatchKernel:
     """CompiledKernel-compatible facade selecting a complete variant per call."""
 
@@ -324,9 +347,11 @@ class BatchKernel:
                 return
             # Capture cannot trigger loading a new guarded variant. A normal
             # eager warmup initializes both complete handles beforehand.
-            if _capture_state() and getattr(self.baseline, "_run", None) is None:
+            baseline = self.baseline._kernel if isinstance(self.baseline, DeferredBaseline) else self.baseline
+            if _capture_state() and (baseline is None or getattr(baseline, "_run", None) is None):
                 raise RuntimeError("warm up the block batching baseline before graph capture")
-            self.baseline._init_handles()
+            if self.candidate is None or not isinstance(self.baseline, DeferredBaseline):
+                self.baseline._init_handles()
             if self.candidate is not None:
                 from triton.runtime.errors import OutOfResources
                 try:
@@ -338,6 +363,7 @@ class BatchKernel:
                     self.block_batching.update(compile_status="REJECTED", reason=str(error), owner="none")
                     self.candidate = None
                     self._contract = None
+                    self.baseline._init_handles()
                     self._set_primary(self.baseline)
             self._ready = True
 
@@ -376,6 +402,12 @@ class BatchKernel:
                 accepted, reason = contract.guard([arguments[index] for index in contract.positions], grid)
                 if accepted:
                     selected = contract.candidate
+        if selected is self.baseline and isinstance(selected, DeferredBaseline):
+            if _capture_state() is not False and (selected._kernel is None
+                                                  or getattr(selected._kernel, "_run", None) is None):
+                raise RuntimeError("prepare the unmerged variant before graph capture")
+            selected = selected.materialize()
+            selected._init_handles()
         # Never mix baseline function/metadata/workspace/layout with candidate.
         forwarded = list(launch)
         forwarded[4], forwarded[5] = selected.function, selected.packed_metadata

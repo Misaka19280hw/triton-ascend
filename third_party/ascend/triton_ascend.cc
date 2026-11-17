@@ -11,6 +11,7 @@
 #include "mlir/Transforms/Passes.h" // createInlinerPass
 
 #include "ascend/include/AutoBlockify/Passes.h"
+#include "ascend/include/BlockAuto/Analysis.h"
 #ifdef TRITON_ASCEND_ENABLE_PROTON
 #include "ascend/include/ProtonToHIVM/Passes.h"
 #endif
@@ -660,6 +661,19 @@ void init_triton_ascend(py::module &&m) {
   init_buffer_ir(libtriton.def_submodule("buffer_ir"));
 
   auto passes = m.def_submodule("passes");
+  // Host-only frontend scoring and bounded axis/factor planning.
+  m.def(
+      "score_block_ttir",
+      [](mlir::ModuleOp module, const std::string &request) {
+        return mlir::triton::ascend::scoreBlockTtir(module, request);
+      },
+      py::call_guard<py::gil_scoped_release>());
+  m.def(
+      "select_block_candidates",
+      [](const std::string &request) {
+        return mlir::triton::ascend::selectBlockCandidates(request);
+      },
+      py::call_guard<py::gil_scoped_release>());
   // load dialects
 
   m.def("serialize_block_input", [](mlir::ModuleOp module) {

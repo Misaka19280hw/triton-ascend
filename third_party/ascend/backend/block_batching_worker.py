@@ -644,11 +644,13 @@ class CandidateCompiler:
             raise BatchCompileError('invalid compilation timing record', kind='ProtocolError') from error
         return None, (cache, dict(generation=generation, manifest=manifest), group, variant, timings)
 
-    def compile(self, baseline, options, request, positions):
+    def compile(self, baseline, options, request, positions, *, defer_fallback=False, allow_layout_retry=True):
         with ExitStack() as pending:
-            return self._compile_and_bind(baseline, options, request, positions, pending)
+            return self._compile_and_bind(baseline, options, request, positions, pending, defer_fallback,
+                                          allow_layout_retry)
 
-    def _compile_and_bind(self, baseline, options, request, positions, pending):
+    def _compile_and_bind(self, baseline, options, request, positions, pending, defer_fallback=False,
+                          allow_layout_retry=True):
         from triton import knobs
         from triton.compiler.compiler import CompiledKernel, _notify_compilation_listener
         from .block_batching import BatchKernel, IMPLEMENTATION_VERSION
@@ -656,13 +658,15 @@ class CandidateCompiler:
         options = dict(options)
         decline, compiled = self._variant(options, pending)
         retry = None
-        if (decline and decline['reason'] == 'LAYOUT_TARGET_RESOURCE_REJECTED' and decline.get('stage') == 'npubin'
-                and decline.get('factor') == request.factor and decline.get('axis') == request.axis
-                and options.get('block_batching_layout', 'auto') == 'auto'):
+        if (allow_layout_retry and decline and decline['reason'] == 'LAYOUT_TARGET_RESOURCE_REJECTED'
+                and decline.get('stage') == 'npubin' and decline.get('factor') == request.factor
+                and decline.get('axis') == request.axis and options.get('block_batching_layout', 'auto') == 'auto'):
             retry = {key: decline[key] for key in ('reason', 'stage', 'diagnostic')}
             pending.close()
             decline, compiled = self._variant(dict(options, block_batching_layout='semantic_only'), pending)
         if decline:
+            if defer_fallback:
+                return BatchDecline(**decline)
             return rejected_bundle(baseline, request, decline, positions, retry)
         cache, record, group, variant, timings = compiled
         try:
