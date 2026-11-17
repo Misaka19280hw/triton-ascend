@@ -491,9 +491,6 @@ def _worker():
             status, payload = _probe_selection(body, directory)
         elif operation in ('analyze', 'probe'):
             status, payload = _native_report(operation, body, directory)
-        elif operation == 'select':
-            from .block_auto import _native
-            status, payload = 'Success', dict(report=_native('rank', body['contract'], candidates=body['candidates']))
         else:
             raise ValueError('unknown worker operation')
     except Exception as error:

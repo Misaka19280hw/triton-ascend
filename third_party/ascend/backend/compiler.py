@@ -943,9 +943,6 @@ def _finish_batch_compilation(metadata, opt, npu_compiler_path, bin_path, save_t
             return decline
         metadata["block_batching_binary_sha256"] = hashlib.sha256(Path(bin_path).read_bytes()).hexdigest()
         metadata["block_batching_plan_sha256"] = metadata["block_batching"]["guard"]["plan_fingerprint"]
-    if opt.block_auto_collect:
-        from .block_auto_artifacts import collect
-        metadata["block_auto_evidence"] = collect(save_temps, npu_compiler_path, metadata)
     return Path(bin_path).read_bytes()
 
 
@@ -1190,7 +1187,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         if plan_memory_strategy is not None:
             _compile_option_list += [f"--plan-memory-strategy={plan_memory_strategy}"]
 
-        if opt.debug or opt.block_auto_collect:
+        if opt.debug:
             save_temps = _get_save_temps_dir(metadata["hash"]) if opt.debug else tmpdir
             _compile_option_list += [f"--save-temps={save_temps}"]
 
@@ -1231,7 +1228,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             __load_metadata_by_callback(callback_path, metadata)
 
         return _finish_batch_compilation(metadata, opt, npu_compiler_path, bin_path,
-                                         save_temps if opt.debug or opt.block_auto_collect else None)
+                                         save_temps if opt.debug else None)
 
 
 def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
@@ -1400,7 +1397,7 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
 
         save_temps = _get_save_temps_dir(metadata["hash"]) if opt.debug else tmpdir
-        if opt.debug or opt.block_auto_collect:
+        if opt.debug:
             _compile_option_list += [f"--save-temps={save_temps}"]
 
         masked_options = _masked_batch_compile_options(metadata, npu_compiler_path)
@@ -1540,7 +1537,6 @@ class NPUOptions:
     profile_scratch_size: int = 0
     enable_graph_optimize: bool = True
     block_auto_contract: Optional[str] = None
-    block_auto_collect: bool = False
     # Parent-resolved (architecture, graph core count, effective core limit,
     # SIMT stack bytes). Included in the normal option hash and worker request.
     block_compile_context: Optional[Tuple] = None

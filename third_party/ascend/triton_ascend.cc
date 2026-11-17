@@ -11,7 +11,6 @@
 #include "mlir/Transforms/Passes.h" // createInlinerPass
 
 #include "ascend/include/AutoBlockify/Passes.h"
-#include "ascend/include/BlockAuto/Analysis.h"
 #ifdef TRITON_ASCEND_ENABLE_PROTON
 #include "ascend/include/ProtonToHIVM/Passes.h"
 #endif
@@ -662,12 +661,6 @@ void init_triton_ascend(py::module &&m) {
 
   auto passes = m.def_submodule("passes");
   // load dialects
-  m.def(
-      "select_block_candidates",
-      [](const std::string &request) {
-        return mlir::triton::ascend::selectBlockCandidates(request);
-      },
-      py::call_guard<py::gil_scoped_release>());
 
   m.def("serialize_block_input", [](mlir::ModuleOp module) {
     std::string data;
