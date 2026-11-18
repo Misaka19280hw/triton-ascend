@@ -662,6 +662,9 @@ void init_triton_ascend(py::module &&m) {
 
   auto passes = m.def_submodule("passes");
   // Host-only frontend scoring and bounded axis/factor planning.
+  m.def("block_data_only_arguments",
+        &mlir::triton::ascend::blockDataOnlyArguments,
+        py::call_guard<py::gil_scoped_release>());
   m.def(
       "score_block_ttir",
       [](mlir::ModuleOp module, const std::string &request) {

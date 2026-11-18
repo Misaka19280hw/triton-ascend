@@ -96,14 +96,28 @@ def _argument(value):
 
 
 def prepare_launch(fn, args, kwargs, grid, warmup, device, backend):
+    return _prepare_launch(fn, args, kwargs, grid, warmup, device, backend)[:2]
+
+
+def _generalize_data_arguments(arguments, names):
+    for name in names:
+        argument = arguments.get(name, {})
+        value = argument.get("value")
+        # Preserve common constant-folding cases; other data-only integers
+        # are scored as runtime operands, independent of first launch order.
+        if type(value) is int and value not in (-1, 0, 1):
+            del argument["value"]
+
+
+def _prepare_launch(fn, args, kwargs, grid, warmup, device, backend):
     if "block_batching_factor" in fn.arg_names or kwargs.get("block_batching_factor", "auto") != "auto":
-        return kwargs, grid
+        return kwargs, grid, None
     from .reuse.config import enabled as reuse_enabled
 
     def baseline():
         result = dict(kwargs, block_batching_factor=1)
         result.pop("block_auto_contract", None)
-        return result, grid
+        return result, grid, None
 
     from triton.runtime.autotuner import _autotuning_kernel
     if "block_batching_factor" not in kwargs and _autotuning_kernel.get() is fn.fn:
@@ -114,7 +128,7 @@ def prepare_launch(fn, args, kwargs, grid, warmup, device, backend):
     if (reuse_enabled() or getattr(getattr(fn, "ASTSource", None), "frontend_kind", "triton") != "triton"
             or not supports_target(backend.target.arch) or _capture_state() is not False):
         return baseline()
-    bound, specialization, _ = fn.device_caches[device][4](*args, **kwargs)
+    bound, specialization, raw_options = fn.device_caches[device][4](*args, **kwargs)
     if callable(grid):
         grid = grid(bound)
     if not isinstance(grid, (tuple, list)) or not 1 <= len(grid) <= 3 or any(
@@ -134,6 +148,16 @@ def prepare_launch(fn, args, kwargs, grid, warmup, device, backend):
     # dtype-only warmup uses MockTensor, which has no real storage/layout.
     if warmup and any(value["kind"] == "unsupported" for value in arguments.values()):
         return baseline()
+    family = None
+    if any(type(arg.get("value")) is int for arg in arguments.values()):
+        # The input TTIR depends on the ordinary JIT specialization and
+        # compiler options. The decision below still includes grid and layout.
+        key = ("block_auto_data_arguments", fn.cache_key, tuple(specialization), str(raw_options))
+        known = fn.device_caches[device][0].get(key)
+        if known is None:
+            family = key
+        else:
+            _generalize_data_arguments(arguments, known)
     contract = dict(grid=extents, arguments=arguments, argument_order=list(arguments),
                     core_floor=os.getenv("TA_BLOCK_BATCHING_CORE_FLOOR"), device_limit=os.getenv("NPU_DEVICE_LIMIT"))
     if str(backend.target.arch).startswith("Ascend910_93"):
@@ -147,8 +171,9 @@ def prepare_launch(fn, args, kwargs, grid, warmup, device, backend):
         for key, value in kwargs.items()
         if key not in ("block_batching_factor", "block_batching_grid", "block_auto_contract")
     }
-    return dict(result, block_batching_factor="auto", block_batching_grid=extents,
-                block_auto_contract=json.dumps(contract, sort_keys=True, separators=(",", ":"), allow_nan=False)), grid
+    result.update(block_batching_factor="auto", block_batching_grid=extents,
+                  block_auto_contract=json.dumps(contract, sort_keys=True, separators=(",", ":"), allow_nan=False))
+    return result, grid, family
 
 
 def _annotate_launch_grid(kwargs, grid, *, bind=None):
@@ -180,7 +205,7 @@ class _BatchLaunchHandler:
     """Block-batching policy behind the existing backend JIT continuation."""
 
     def run(self, fn, args, kwargs, grid, warmup, device, stream, backend, jit_tail):
-        kwargs, grid = prepare_launch(fn, args, kwargs, grid, warmup, device, backend)
+        kwargs, grid, family = _prepare_launch(fn, args, kwargs, grid, warmup, device, backend)
         # Preserve pre-run hooks, cache identity and single callback evaluation
         # without adding a hook to the common JIT frontend.
         bind = None if warmup else lambda: fn.device_caches[device][4](*args, **kwargs)[0]
@@ -195,8 +220,11 @@ class _BatchLaunchHandler:
             return get_handler().run(fn, args, kwargs, grid, warmup, device, stream, backend, jit_tail)
         if kwargs.get("block_batching_factor") == "auto":
             cache = fn.device_caches[device][0]
-            return jit_tail(args, kwargs, grid, warmup, device, stream,
-                            initialize=lambda kernel: initialize_auto_kernel(cache, kernel))
+            kernel = jit_tail(args, kwargs, grid, warmup, device, stream,
+                              initialize=lambda kernel: initialize_auto_kernel(cache, kernel))
+            if family is not None and isinstance(kernel, BatchKernel) and hasattr(kernel, "block_auto_data_arguments"):
+                cache[family] = kernel.block_auto_data_arguments
+            return kernel
         return jit_tail(args, kwargs, grid, warmup, device, stream)
 
 

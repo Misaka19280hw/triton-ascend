@@ -201,10 +201,15 @@ def compile_auto_bundle(backend, src, options, compile_variant, *, env_vars):
     positions = compilation._runtime_positions(src)
     if isinstance(positions, BatchDecline):
         return compile_variant(baseline_options)
-    scalar_arguments = [contract["arguments"].get(src.fn.arg_names[index], {}).get("value") for index in positions]
-    frozen = compilation._freeze_source(backend, src, baseline_options, normalized.block_batching_backend_revision)
+    from .block_batching import _generalize_data_arguments
+    arguments = contract["arguments"]
+    has_integer = any(type(arg.get("value")) is int for arg in arguments.values())
+    frozen = compilation._freeze_source(backend, src, baseline_options, normalized.block_batching_backend_revision,
+                                        scalar_positions=positions if has_integer else ())
     if isinstance(frozen, BatchDecline):
         return compile_variant(baseline_options)
+    _generalize_data_arguments(arguments, vars(frozen).get("block_auto_data_arguments", ()))
+    scalar_arguments = [arguments.get(src.fn.arg_names[index], {}).get("value") for index in positions]
     # The hook supplies the same immutable environment to F1 and each child.
     env_vars = dict(env_vars)
     selection_options = dict(common, block_batching_factor=1)
@@ -295,4 +300,6 @@ def _compile_selected(backend, frozen, common, baseline_options, compile_variant
     selection.pop("factor")
     result.block_auto_selection = dict(selection, selected_factor=factor, candidate_plan=plan,
                                        compile_rejections=declines)
+    if "block_auto_data_arguments" in vars(frozen):
+        result.block_auto_data_arguments = frozen.block_auto_data_arguments
     return result

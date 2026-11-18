@@ -1,6 +1,7 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 """TTIR scoring, isolated selection and bounded backend compilation; CPU-only."""
 from block_batching_test_utils import assign_npu  # noqa: F401 - CPU-only fixture
+from block_batching_test_utils import parse
 import importlib
 import json
 import hashlib
@@ -18,6 +19,50 @@ from triton._C.libtriton import ascend, ir
 from triton.backends.ascend import block_batching as batching
 from triton.backends.ascend.compiler import AscendBackend
 from triton.backends.compiler import GPUTarget
+
+
+def test_data_only_scalar_through_generator_arithmetic(tmp_path):
+    module = parse(tmp_path, '''module {
+      tt.func public @gen(%out: !tt.ptr<i32>, %seed: i32) {
+        %r = tt.make_range {start = 0 : i32, end = 8 : i32} : tensor<8xi32>
+        %s = tt.splat %seed : i32 -> tensor<8xi32>
+        %v = arith.addi %s, %r : tensor<8xi32>
+        %bits = arith.muli %v, %v : tensor<8xi32>
+        %keep = arith.cmpi ult, %bits, %v : tensor<8xi32>
+        %data = arith.select %keep, %bits, %v : tensor<8xi1>, tensor<8xi32>
+        %p = tt.splat %out : !tt.ptr<i32> -> tensor<8x!tt.ptr<i32>>
+        %ptrs = tt.addptr %p, %r : tensor<8x!tt.ptr<i32>>, tensor<8xi32>
+        tt.store %ptrs, %data : tensor<8x!tt.ptr<i32>>
+        tt.return
+      }
+    }''')
+    assert list(ascend.block_data_only_arguments(module, 2)) == [1]
+    assert list(ascend.block_data_only_arguments(module, 3)) == []
+
+
+def test_address_mask_and_control_scalars_keep_their_values(tmp_path):
+    module = parse(tmp_path, '''module {
+      tt.func public @mixed(%direct: i32, %data: i32, %out: !tt.ptr<i32>,
+                            %indirect: i32, %bound: i32, %count: index, %branch: i1,
+                            %slot: !tt.ptr<!tt.ptr<i32>>, %escaped: i32) {
+        %c0 = arith.constant 0 : index
+        %c1 = arith.constant 1 : index
+        %p = tt.addptr %out, %direct : !tt.ptr<i32>, i32
+        %offset = arith.addi %indirect, %indirect : i32
+        %q = tt.addptr %p, %offset : !tt.ptr<i32>, i32
+        %mask = arith.cmpi slt, %direct, %bound : i32
+        scf.for %i = %c0 to %count step %c1 {
+          scf.if %branch {
+            tt.store %q, %direct : !tt.ptr<i32>
+          }
+        }
+        %stored_ptr = tt.addptr %p, %escaped : !tt.ptr<i32>, i32
+        tt.store %slot, %stored_ptr : !tt.ptr<!tt.ptr<i32>>
+        tt.store %p, %data, %mask : !tt.ptr<i32>
+        tt.return
+      }
+    }''')
+    assert list(ascend.block_data_only_arguments(module, 9)) == [1]
 
 
 class TestTtirAnalysis(unittest.TestCase):
@@ -627,7 +672,7 @@ class TestHostIntegration(unittest.TestCase):
         self.addCleanup(capture.stop)
         self.backend = SimpleNamespace(target=SimpleNamespace(arch="Ascend950"),
                                        prepare_block_compile_options=lambda values, **_: dict(values))
-        self.fn = SimpleNamespace(fn=lambda: None, arg_names=["x", "size", "BLOCK"],
+        self.fn = SimpleNamespace(fn=lambda: None, cache_key="test-kernel", arg_names=["x", "size", "BLOCK"],
                                   device_caches={0: [{}, None, None, None, self.bind]})
         self.kwargs = dict(block_batching_factor="auto", BLOCK=512)
         self.result = object()
@@ -644,6 +689,40 @@ class TestHostIntegration(unittest.TestCase):
     def run_handler(self, grid=(256, ), warmup=False):
         return self.batching.get_launch_handler().run(self.fn, (Tensor(), 131072), self.kwargs, grid, warmup, 0, 42,
                                                       self.backend, self.tail)
+
+    def test_cached_proof_shares_data_values_only_within_one_abi(self):
+        def bind(output, seed, offset, **options):
+            # A kernel that disables alignment specialization for these runtime integers.
+            seed_type = "i32" if seed < 2**31 else "u32"
+            return dict(output=output, seed=seed, offset=offset), [("*fp32", None), (seed_type, None),
+                                                                 ("i32", None)], options
+
+        self.fn.arg_names = ["output", "seed", "offset"]
+        self.fn.device_caches[0][4] = bind
+        kernel = Mock(spec=self.batching.BatchKernel)
+        kernel.block_auto_data_arguments = ("seed", )
+        seen = []
+
+        def tail(args, kwargs, *more, **hooks):
+            seen.append((args[1:], json.loads(kwargs["block_auto_contract"])["arguments"]))
+            return kernel
+
+        def launch(seed, offset=32):
+            args = (Tensor(), seed, offset)
+            self.batching.get_launch_handler().run(self.fn, args, {}, (256, ), False, 0, 42, self.backend, tail)
+            self.assertEqual(seen[-1][0], (seed, offset))
+            return seen[-1][1]
+
+        self.assertEqual(launch(8)["seed"]["value"], 8)  # A cold family needs the native TTIR proof.
+        shared = launch(8)
+        self.assertNotIn("value", shared["seed"])
+        self.assertEqual(launch(16), shared)
+        self.assertEqual(launch(16, 64)["offset"]["value"], 64)
+        for value in (-1, 0, 1):
+            self.assertEqual(launch(value)["seed"]["value"], value)
+        self.assertEqual(launch(2**31)["seed"]["value"], 2**31)  # A new ABI needs its own proof.
+        self.fn.cache_key = "different-source"
+        self.assertEqual(launch(8)["seed"]["value"], 8)
 
     def test_auto_contract_resolves_grid_once_and_excludes_constexpr(self):
 

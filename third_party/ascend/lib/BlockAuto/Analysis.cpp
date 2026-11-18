@@ -7,10 +7,13 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/TypeUtilities.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/JSON.h"
@@ -668,6 +671,54 @@ static TtirWork ttirWork(ModuleOp module, const Profile &profile,
 } // namespace mlir::triton::ascend::blockauto
 
 namespace mlir::triton::ascend {
+std::vector<unsigned> blockDataOnlyArguments(ModuleOp module, unsigned arity) {
+  if (!llvm::hasSingleElement(*module.getBody()))
+    return {};
+  auto fn = dyn_cast<triton::FuncOp>(&module.getBody()->front());
+  if (!fn || !fn.isPublic() || fn.getNumArguments() != arity ||
+      !llvm::hasSingleElement(fn.getBody()))
+    return {};
+
+  // Follow every use, including both roles if a value is stored under itself
+  // as the mask. An unrecognized consumer keeps the scalar exact.
+  llvm::DenseSet<Operation *> dataConsumers;
+  auto onlyDataUses = [&](Value value) {
+    return llvm::all_of(value.getUses(), [&](OpOperand &use) {
+      Operation *owner = use.getOwner();
+      if (!dataConsumers.contains(owner))
+        return false;
+      auto store = dyn_cast<triton::StoreOp>(owner);
+      return !store || &use == &store.getValueMutable();
+    });
+  };
+  bool outputTail = true;
+  for (Operation &op : llvm::reverse(fn.getBody().front())) {
+    if (auto store = dyn_cast<triton::StoreOp>(op)) {
+      if (outputTail && getElementTypeOrSelf(store.getValue()).isIntOrFloat())
+        dataConsumers.insert(&op);
+      continue;
+    }
+    if (isa<triton::ReturnOp>(op))
+      continue;
+    // A later read may observe the stored value through an alias.
+    if (op.getNumRegions() || !isMemoryEffectFree(&op))
+      outputTail = false;
+    if (isa<triton::SplatOp, triton::BitcastOp, arith::BitcastOp,
+            arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp, arith::AddIOp,
+            arith::SubIOp, arith::MulIOp, arith::AndIOp, arith::OrIOp,
+            arith::XOrIOp, arith::ShLIOp, arith::ShRSIOp, arith::ShRUIOp,
+            arith::CmpIOp, arith::SelectOp>(op) &&
+        onlyDataUses(op.getResult(0)))
+      dataConsumers.insert(&op);
+  }
+
+  std::vector<unsigned> arguments;
+  for (BlockArgument arg : fn.getArguments())
+    if (isa<IntegerType>(arg.getType()) && onlyDataUses(arg))
+      arguments.push_back(arg.getArgNumber());
+  return arguments;
+}
+
 std::string scoreBlockTtir(ModuleOp module, llvm::StringRef request) {
   using namespace blockauto;
   auto parsed = json::parse(request);

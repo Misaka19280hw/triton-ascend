@@ -851,7 +851,7 @@ def _runtime_positions(src):
     return result
 
 
-def _freeze_source(backend, src, baseline_options, backend_revision):
+def _freeze_source(backend, src, baseline_options, backend_revision, *, scalar_positions=()):
     """Generate frontend IR once, then parse the same immutable snapshot per variant."""
     import hashlib
     from triton._C.libtriton import ascend, ir
@@ -876,7 +876,11 @@ def _freeze_source(backend, src, baseline_options, backend_revision):
     path = cache.put(data, "block_batching.original.ttir", binary=True)
 
     from .block_batching_source import FrozenSource
-    return FrozenSource(src, path, fingerprint, hashlib.sha256(data).hexdigest())
+    frozen = FrozenSource(src, path, fingerprint, hashlib.sha256(data).hexdigest())
+    if scalar_positions:
+        frozen.block_auto_data_arguments = tuple(src.fn.arg_names[scalar_positions[i]]
+                                                 for i in ascend.block_data_only_arguments(module, len(scalar_positions)))
+    return frozen
 
 
 def rejected_bundle(baseline, request, decline, positions=(), retry=None):
