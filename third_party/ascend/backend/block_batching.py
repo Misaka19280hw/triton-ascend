@@ -180,7 +180,7 @@ def _prepare_launch(fn, args, kwargs, grid, warmup, device, backend, binding=Non
         # The input TTIR depends on the ordinary JIT specialization and
         # compiler options. The decision below still includes grid and layout.
         key = ("block_auto_data_arguments", fn.cache_key, tuple(specialization), str(raw_options))
-        known = fn.device_caches[device][0].get(key)
+        known = fn.device_caches[device][1].get(key)
         if known is None:
             family = key
         else:
@@ -263,7 +263,7 @@ class _BatchLaunchHandler:
             kernel = jit_tail(args, kwargs, grid, warmup, device, stream, memory_key=memory_key,
                               initialize=lambda kernel: initialize_auto_kernel(cache, kernel))
             if family is not None and isinstance(kernel, BatchKernel) and hasattr(kernel, "block_auto_data_arguments"):
-                fn.device_caches[device][0][family] = kernel.block_auto_data_arguments
+                fn.device_caches[device][1][family] = kernel.block_auto_data_arguments
             return kernel
         return jit_tail(args, kwargs, grid, warmup, device, stream)
 
